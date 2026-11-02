@@ -1,6 +1,7 @@
 # Dynamic Memory Management for Apache AsterixDB (GSoC 2026)
 
 Alexander Anokhin
+
 Mentor: Dr. Shiva Jahangiri
 
 This repo holds Google Summer of Code 2026 work for Apache AsterixDB: the files
