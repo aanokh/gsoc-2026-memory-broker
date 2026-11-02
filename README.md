@@ -1,7 +1,25 @@
 # Dynamic Memory Management for Apache AsterixDB (GSoC 2026)
 
-This repo holds my Google Summer of Code 2026 work for Apache AsterixDB: the files
+Alexander Anokhin
+Mentor: Dr. Shiva Jahangiri
+
+This repo holds Google Summer of Code 2026 work for Apache AsterixDB: the files
 the patch adds or changes, and the patch itself (`memory-broker.patch`).
+
+AsterixDB gives each operator a fixed memory budget at compile time, so memory sits idle while other operators spill. This project adds a per-node broker that moves memory between operators at runtime.
+
+## Main Deliverables
+- **ResourceBroker:** a per-node shared data structure that holds a free memory pool, gives each query a fair
+  share, and lends idle memory to operators that request memory.
+- **Pluggable victimization (`IBrokerStrategy`):** when memory runs out, the broker takes it back from an operator
+  above its fair share. Implemented strategies like victimizing largest holder, or victimizing in order of memory difficulty tier.
+- **Operator interface:** operators register, request memory, release it when asked, and deregister when done.
+- **MemoryContentionResponsiveHHJ:** a memory-adaptive hash join based on Giulliano Siviero's prototype (https://github.com/gSiviero/MemoryContentionHHJ/pull/2), with two
+  bug fixes (dropped reused frames, stale buffers after a hash table rebuild).
+- **Admission reservation:** each job's memory estimate is reserved on the node before its operators start.
+
+## Status
+Not merged yet, Gerrit review pending. Future work is listed at the end of the commit message below.
 
 ## How to apply and build
 
