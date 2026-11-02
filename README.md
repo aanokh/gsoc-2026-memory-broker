@@ -20,7 +20,7 @@ AsterixDB gives each operator a fixed memory budget at compile time, so memory s
 - **Admission reservation:** each job's memory estimate is reserved on the node before its operators start.
 
 ## Status
-Not merged yet, Gerrit review pending. Future work is listed at the end of the commit message below.
+Not merged yet, Gerrit review pending (https://asterix-gerrit.ics.uci.edu/c/asterixdb/+/22203). Future work is listed at the end of the commit message below.
 
 ## How to apply and build
 
