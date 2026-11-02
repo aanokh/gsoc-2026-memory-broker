@@ -1,0 +1,2416 @@
+From 0c20710dcd16e8f4c5c9fb931216df5a4e7695d9 Mon Sep 17 00:00:00 2001
+From: aanokh <alexander.g.anokhin@gmail.com>
+Date: Mon, 2 Nov 2026 08:41:56 -0800
+Subject: [PATCH] [ASTERIXDB-3703][HYR] Add a per-node memory broker and a
+ memory adaptive hash join
+
+- user model changes: no
+- storage format changes: no
+- interface changes: yes
+
+Details: Adds a ResourceBroker on each NC that distributes operator
+memory in frames during runtime. Victim selection when memory runs out
+is pluggable through IBrokerStrategy. Before a job's operators start,
+the broker reserves the job's existing compile-time memory estimate for
+that node, passed per node as requiredNodeMemory in JobSpecification.
+
+APE link: https://cwiki.apache.org/confluence/spaces/ASTERIXDB/pages/449282523/APE+35+Dynamic+Operator+Memory+Broker
+
+MemoryContentionResponsiveHHJ requests memory when a partition fills and
+spills when its budget is cut. It is based on Giulliano Siviero's
+prototype: https://github.com/gSiviero/MemoryContentionHHJ/pull/2
+Fixed-budget operators register their budget through new static frame
+pools.
+
+On top of the prototype, VPartitionTupleBufferManager now restamps the
+frame size header when it reuses a pool frame, which previously dropped
+frames, and InMemoryHashJoin clears stale buffers and recomputes its
+empty-table flag when the hash table is rebuilt during the probe.
+
+Future work: consider fair shares per query, explore how memory tiering
+interacts with other operators, and explore more advanced victimization
+strategies.
+
+Co-Authored-By: Giulliano Siviero <gsilvazanottisiviero@scu.edu>
+Generated-by: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: Icc3a6169b2b8cd99a6a2f4b0fc9fdf7fec29a968
+---
+ .../asterix/api/common/APIFramework.java      |   2 +
+ .../resource/OperatorResourcesComputer.java   |  14 +
+ .../asterix/app/resource/PlanStage.java       |   4 +
+ .../hyracks/bootstrap/NCApplication.java      |   9 +
+ .../apache/asterix/utils/ResourceUtils.java   |  20 +
+ .../joins/interval/IntervalMergeJoiner.java   |   5 +-
+ .../joins/spatial/SpatialJoiner.java          |   5 +-
+ .../api/application/INCServiceContext.java    |   5 +
+ ...nActivityClusterGraphGeneratorFactory.java |   1 +
+ .../api/context/IHyracksJobletContext.java    |   3 +
+ .../hyracks/api/job/ActivityClusterGraph.java |  10 +
+ .../hyracks/api/job/JobSpecification.java     |  10 +
+ .../api/resources/memory/IResourceBroker.java |  67 +++
+ .../memory/OperatorMemoryHandle.java          |  57 +++
+ .../nc/application/NCServiceContext.java      |  12 +
+ .../nc/resources/memory/GrantStrategy.java    |  50 ++
+ .../nc/resources/memory/IBrokerStrategy.java  |  57 +++
+ .../nc/resources/memory/NoWaitStrategy.java   |  29 ++
+ .../nc/resources/memory/ReserveStrategy.java  |  53 ++
+ .../nc/resources/memory/ResourceBroker.java   | 460 ++++++++++++++++++
+ .../nc/resources/memory/StopRuleStrategy.java |  37 ++
+ .../nc/resources/memory/TieredStrategy.java   |  52 ++
+ .../resources/memory/VictimizeStrategy.java   |  68 +++
+ .../buffermanager/DeallocatableFramePool.java |   8 +-
+ .../DeallocatableFramePoolDynamicBudget.java  | 131 +++++
+ .../DeallocatableFramePoolStaticBudget.java   |  53 ++
+ .../VPartitionTupleBufferManager.java         |   1 +
+ .../VariableFramePoolStaticBudget.java        |  52 ++
+ .../std/group/HashSpillableTableFactory.java  |   5 +-
+ .../dataflow/std/join/InMemoryHashJoin.java   |  10 +-
+ .../InMemoryHashJoinOperatorDescriptor.java   |   4 +-
+ .../join/MemoryContentionResponsiveHHJ.java   | 168 +++++++
+ .../dataflow/std/join/NestedLoopJoin.java     |  21 +-
+ .../NestedLoopJoinOperatorDescriptor.java     |   4 +-
+ .../std/join/OptimizedHybridHashJoin.java     |  55 ++-
+ ...mizedHybridHashJoinOperatorDescriptor.java |  18 +-
+ .../AbstractExternalSortRunGenerator.java     |   4 +-
+ .../std/sort/HeapSortRunGenerator.java        |   4 +-
+ .../std/sort/HybridTopKSortRunGenerator.java  |   4 +-
+ ...vertedIndexSearchOperatorNodePushable.java |  13 +-
+ .../lsm/vector/impls/SpillableTopKBuffer.java |   4 +-
+ .../test/support/TestJobletContext.java       |   6 +
+ .../test/support/TestNCServiceContext.java    |  11 +
+ 43 files changed, 1544 insertions(+), 62 deletions(-)
+ create mode 100644 hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/resources/memory/IResourceBroker.java
+ create mode 100644 hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/resources/memory/OperatorMemoryHandle.java
+ create mode 100644 hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/GrantStrategy.java
+ create mode 100644 hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/IBrokerStrategy.java
+ create mode 100644 hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/NoWaitStrategy.java
+ create mode 100644 hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/ReserveStrategy.java
+ create mode 100644 hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/ResourceBroker.java
+ create mode 100644 hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/StopRuleStrategy.java
+ create mode 100644 hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/TieredStrategy.java
+ create mode 100644 hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/VictimizeStrategy.java
+ create mode 100644 hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/DeallocatableFramePoolDynamicBudget.java
+ create mode 100644 hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/DeallocatableFramePoolStaticBudget.java
+ create mode 100644 hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/VariableFramePoolStaticBudget.java
+ create mode 100644 hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/MemoryContentionResponsiveHHJ.java
+
+diff --git a/asterixdb/asterix-app/src/main/java/org/apache/asterix/api/common/APIFramework.java b/asterixdb/asterix-app/src/main/java/org/apache/asterix/api/common/APIFramework.java
+index 8b0472e482..6fa293b5a2 100644
+--- a/asterixdb/asterix-app/src/main/java/org/apache/asterix/api/common/APIFramework.java
++++ b/asterixdb/asterix-app/src/main/java/org/apache/asterix/api/common/APIFramework.java
+@@ -425,6 +425,8 @@ public class APIFramework {
+                                 ResourceUtils.getRequiredCapacity(plan, jobLocations, physOptConf, compilerProperties);
+                         addRuntimeMemoryOverhead(jobRequiredCapacity, compilerProperties);
+                         spec.setRequiredClusterCapacity(jobRequiredCapacity);
++                        spec.setRequiredNodeMemory(ResourceUtils.getRequiredNodeMemory(plan, jobLocations, physOptConf,
++                                compilerProperties));
+                     }
+                 }
+             }
+diff --git a/asterixdb/asterix-app/src/main/java/org/apache/asterix/app/resource/OperatorResourcesComputer.java b/asterixdb/asterix-app/src/main/java/org/apache/asterix/app/resource/OperatorResourcesComputer.java
+index 9e779229d7..393aae8cde 100644
+--- a/asterixdb/asterix-app/src/main/java/org/apache/asterix/app/resource/OperatorResourcesComputer.java
++++ b/asterixdb/asterix-app/src/main/java/org/apache/asterix/app/resource/OperatorResourcesComputer.java
+@@ -74,6 +74,20 @@ public class OperatorResourcesComputer {
+         }
+     }
+ 
++    public long getOperatorRequiredMemoryPerPartition(ILogicalOperator operator) {
++        if (operator.getOperatorTag() == LogicalOperatorTag.EXCHANGE) {
++            PhysicalOperatorTag exchangeTag = ((ExchangeOperator) operator).getPhysicalOperator().getOperatorTag();
++            if (exchangeTag == PhysicalOperatorTag.ONE_TO_ONE_EXCHANGE
++                    || exchangeTag == PhysicalOperatorTag.SORT_MERGE_EXCHANGE) {
++                return frameSize;
++            }
++            return 2L * MAX_BUFFER_PER_CONNECTION * numComputationPartitions * frameSize;
++        }
++        IPhysicalOperator physOp = ((AbstractLogicalOperator) operator).getPhysicalOperator();
++        return physOp.getLocalMemoryRequirements().getMemoryBudgetInBytes(frameSize)
++                + getOperatorExpressionsRequiredMemory(operator);
++    }
++
+     private long getOperatorExpressionsRequiredMemory(ILogicalOperator operator) {
+         exprMemoryComputer.reset(operator);
+         try {
+diff --git a/asterixdb/asterix-app/src/main/java/org/apache/asterix/app/resource/PlanStage.java b/asterixdb/asterix-app/src/main/java/org/apache/asterix/app/resource/PlanStage.java
+index 1e623c50fd..0c344f6d78 100644
+--- a/asterixdb/asterix-app/src/main/java/org/apache/asterix/app/resource/PlanStage.java
++++ b/asterixdb/asterix-app/src/main/java/org/apache/asterix/app/resource/PlanStage.java
+@@ -45,6 +45,10 @@ public class PlanStage {
+         return operators.stream().mapToLong(resourcesComputer::getOperatorRequiredMemory).sum();
+     }
+ 
++    public long getRequiredMemoryPerPartition(OperatorResourcesComputer resourcesComputer) {
++        return operators.stream().mapToLong(resourcesComputer::getOperatorRequiredMemoryPerPartition).sum();
++    }
++
+     public int getRequiredCores(OperatorResourcesComputer resourcesComputer) {
+         return operators.stream().mapToInt(resourcesComputer::getOperatorRequiredCores).max()
+                 .orElse(OperatorResourcesComputer.MIN_OPERATOR_CORES);
+diff --git a/asterixdb/asterix-app/src/main/java/org/apache/asterix/hyracks/bootstrap/NCApplication.java b/asterixdb/asterix-app/src/main/java/org/apache/asterix/hyracks/bootstrap/NCApplication.java
+index 970d6fb274..4f132eaeaa 100644
+--- a/asterixdb/asterix-app/src/main/java/org/apache/asterix/hyracks/bootstrap/NCApplication.java
++++ b/asterixdb/asterix-app/src/main/java/org/apache/asterix/hyracks/bootstrap/NCApplication.java
+@@ -113,9 +113,12 @@ import org.apache.hyracks.api.exceptions.HyracksDataException;
+ import org.apache.hyracks.api.io.IFileDeviceResolver;
+ import org.apache.hyracks.api.job.resource.NodeCapacity;
+ import org.apache.hyracks.api.util.JavaSerializationUtils.SerializableExceptionProxy;
++import org.apache.hyracks.control.common.controllers.CCConfig;
+ import org.apache.hyracks.control.common.controllers.NCConfig;
+ import org.apache.hyracks.control.nc.BaseNCApplication;
+ import org.apache.hyracks.control.nc.NodeControllerService;
++import org.apache.hyracks.control.nc.resources.memory.ResourceBroker;
++import org.apache.hyracks.control.nc.resources.memory.VictimizeStrategy;
+ import org.apache.hyracks.http.server.HttpServer;
+ import org.apache.hyracks.http.server.HttpServerConfig;
+ import org.apache.hyracks.http.server.HttpServerConfigBuilder;
+@@ -209,6 +212,12 @@ public class NCApplication extends BaseNCApplication {
+         MessagingChannelInterfaceFactory interfaceFactory =
+                 new MessagingChannelInterfaceFactory(messageBroker, messagingProperties);
+         this.ncServiceCtx.setMessagingChannelInterfaceFactory(interfaceFactory);
++        NodeCapacity capacity = getCapacity();
++        int frameSize = runtimeContext.getCompilerProperties().getFrameSize();
++        int multiprogrammingLevel =
++                capacity.getCores() * ncServiceCtx.getAppConfig().getInt(CCConfig.Option.CORES_MULTIPLIER);
++        this.ncServiceCtx.setResourceBroker(new ResourceBroker((int) (capacity.getMemoryByteSize() / frameSize),
++                multiprogrammingLevel, new VictimizeStrategy()));
+         final Checkpoint latestCheckpoint = runtimeContext.getTransactionSubsystem().getCheckpointManager().getLatest();
+         if (latestCheckpoint != null && latestCheckpoint.getStorageVersion() != StorageConstants.VERSION) {
+             throw new IllegalStateException(
+diff --git a/asterixdb/asterix-app/src/main/java/org/apache/asterix/utils/ResourceUtils.java b/asterixdb/asterix-app/src/main/java/org/apache/asterix/utils/ResourceUtils.java
+index 353bebfc69..b28d116602 100644
+--- a/asterixdb/asterix-app/src/main/java/org/apache/asterix/utils/ResourceUtils.java
++++ b/asterixdb/asterix-app/src/main/java/org/apache/asterix/utils/ResourceUtils.java
+@@ -19,7 +19,9 @@
+ 
+ package org.apache.asterix.utils;
+ 
++import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
+ 
+ import org.apache.asterix.app.resource.OperatorResourcesComputer;
+ import org.apache.asterix.app.resource.PlanStage;
+@@ -63,6 +65,24 @@ public class ResourceUtils {
+                 compilerProperties);
+     }
+ 
++    public static Map<String, Long> getRequiredNodeMemory(ILogicalPlan plan,
++            AlgebricksAbsolutePartitionConstraint computationLocations,
++            PhysicalOptimizationConfig physicalOptimizationConfig, CompilerProperties compilerProperties)
++            throws AlgebricksException {
++        String[] partitionNodes = computationLocations.getLocations();
++        OperatorResourcesComputer computer = new OperatorResourcesComputer(partitionNodes.length,
++                physicalOptimizationConfig.getFrameSize(), compilerProperties);
++        long partitionMemory =
++                getStages(plan).stream().mapToLong(stage -> stage.getRequiredMemoryPerPartition(computer)).max()
++                        .orElseThrow(IllegalStateException::new);
++        partitionMemory += partitionMemory * compilerProperties.getRuntimeMemoryOverheadPercentage() / 100;
++        Map<String, Long> nodeMemory = new HashMap<>();
++        for (String node : partitionNodes) {
++            nodeMemory.merge(node, partitionMemory, Long::sum);
++        }
++        return nodeMemory;
++    }
++
+     public static List<PlanStage> getStages(ILogicalPlan plan) throws AlgebricksException {
+         // There could be only one root operator for a top-level query plan.
+         final ILogicalOperator rootOp = plan.getRoots().get(0).getValue();
+diff --git a/asterixdb/asterix-runtime/src/main/java/org/apache/asterix/runtime/operators/joins/interval/IntervalMergeJoiner.java b/asterixdb/asterix-runtime/src/main/java/org/apache/asterix/runtime/operators/joins/interval/IntervalMergeJoiner.java
+index 41f82b07fd..1805a571a1 100644
+--- a/asterixdb/asterix-runtime/src/main/java/org/apache/asterix/runtime/operators/joins/interval/IntervalMergeJoiner.java
++++ b/asterixdb/asterix-runtime/src/main/java/org/apache/asterix/runtime/operators/joins/interval/IntervalMergeJoiner.java
+@@ -35,7 +35,7 @@ import org.apache.hyracks.api.dataflow.value.RecordDescriptor;
+ import org.apache.hyracks.api.exceptions.HyracksDataException;
+ import org.apache.hyracks.dataflow.common.comm.io.FrameTupleAppender;
+ import org.apache.hyracks.dataflow.common.comm.util.FrameUtils;
+-import org.apache.hyracks.dataflow.std.buffermanager.DeallocatableFramePool;
++import org.apache.hyracks.dataflow.std.buffermanager.DeallocatableFramePoolStaticBudget;
+ import org.apache.hyracks.dataflow.std.buffermanager.IDeallocatableFramePool;
+ import org.apache.hyracks.dataflow.std.buffermanager.IDeletableTupleBufferManager;
+ import org.apache.hyracks.dataflow.std.buffermanager.VariableDeletableTupleMemoryManager;
+@@ -90,7 +90,7 @@ public class IntervalMergeJoiner {
+         inputBuffer[PROBE_PARTITION] = ctx.allocateVSizeFrame();
+ 
+         //Two frames are used for the runfile stream, and one frame for each input (2 outputs).
+-        framePool = new DeallocatableFramePool(ctx, (memorySize - 4) * ctx.getInitialFrameSize());
++        framePool = new DeallocatableFramePoolStaticBudget(ctx, (memorySize - 4) * ctx.getInitialFrameSize());
+         bufferManager = new VariableDeletableTupleMemoryManager(framePool, probeRd);
+         memoryCursor = new TuplePointerCursor(bufferManager.createTuplePointerAccessor());
+ 
+@@ -148,6 +148,7 @@ public class IntervalMergeJoiner {
+         resultAppender.write(writer, true);
+         runFileStream.close();
+         runFileStream.removeRunFile();
++        framePool.close();
+     }
+ 
+     private boolean buildHasNext() throws HyracksDataException {
+diff --git a/asterixdb/asterix-runtime/src/main/java/org/apache/asterix/runtime/operators/joins/spatial/SpatialJoiner.java b/asterixdb/asterix-runtime/src/main/java/org/apache/asterix/runtime/operators/joins/spatial/SpatialJoiner.java
+index 08a0524d5e..1c645b0b40 100644
+--- a/asterixdb/asterix-runtime/src/main/java/org/apache/asterix/runtime/operators/joins/spatial/SpatialJoiner.java
++++ b/asterixdb/asterix-runtime/src/main/java/org/apache/asterix/runtime/operators/joins/spatial/SpatialJoiner.java
+@@ -35,7 +35,7 @@ import org.apache.hyracks.api.dataflow.value.RecordDescriptor;
+ import org.apache.hyracks.api.exceptions.HyracksDataException;
+ import org.apache.hyracks.dataflow.common.comm.io.FrameTupleAppender;
+ import org.apache.hyracks.dataflow.common.comm.util.FrameUtils;
+-import org.apache.hyracks.dataflow.std.buffermanager.DeallocatableFramePool;
++import org.apache.hyracks.dataflow.std.buffermanager.DeallocatableFramePoolStaticBudget;
+ import org.apache.hyracks.dataflow.std.buffermanager.IDeallocatableFramePool;
+ import org.apache.hyracks.dataflow.std.buffermanager.IDeletableTupleBufferManager;
+ import org.apache.hyracks.dataflow.std.buffermanager.VariableDeletableTupleMemoryManager;
+@@ -83,7 +83,7 @@ public class SpatialJoiner {
+         inputBuffer[PROBE_PARTITION] = ctx.allocateVSizeFrame();
+ 
+         //Two frames are used for the runfile stream, and one frame for each input (2 outputs).
+-        framePool = new DeallocatableFramePool(ctx, (memorySize - 4) * ctx.getInitialFrameSize());
++        framePool = new DeallocatableFramePoolStaticBudget(ctx, (memorySize - 4) * ctx.getInitialFrameSize());
+         bufferManager = new VariableDeletableTupleMemoryManager(framePool, probeRd);
+         memoryCursor = new TuplePointerCursor(bufferManager.createTuplePointerAccessor());
+ 
+@@ -141,6 +141,7 @@ public class SpatialJoiner {
+         resultAppender.write(writer, true);
+         runFileStream.close();
+         runFileStream.removeRunFile();
++        framePool.close();
+     }
+ 
+     private boolean buildHasNext() throws HyracksDataException {
+diff --git a/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/application/INCServiceContext.java b/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/application/INCServiceContext.java
+index 9e6ad1db78..b4f78a2fc1 100644
+--- a/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/application/INCServiceContext.java
++++ b/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/application/INCServiceContext.java
+@@ -27,6 +27,7 @@ import org.apache.hyracks.api.job.JobKind;
+ import org.apache.hyracks.api.lifecycle.ILifeCycleComponentManager;
+ import org.apache.hyracks.api.resources.memory.IFrameProfiler;
+ import org.apache.hyracks.api.resources.memory.IMemoryManager;
++import org.apache.hyracks.api.resources.memory.IResourceBroker;
+ import org.apache.hyracks.util.trace.ITracer;
+ 
+ /**
+@@ -92,6 +93,10 @@ public interface INCServiceContext extends IServiceContext {
+ 
+     void setFrameProfiler(IFrameProfiler frameProfiler);
+ 
++    IResourceBroker getResourceBroker();
++
++    void setResourceBroker(IResourceBroker resourceBroker);
++
+     void setVSizeFrameFactoryProvider(Function<JobKind, IVSizeFrameFactory> provider);
+ 
+     IVSizeFrameFactory getVSizeFrameFactoryForKind(JobKind jobKind);
+diff --git a/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/client/impl/JobSpecificationActivityClusterGraphGeneratorFactory.java b/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/client/impl/JobSpecificationActivityClusterGraphGeneratorFactory.java
+index c437aaaf18..07719de4f1 100644
+--- a/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/client/impl/JobSpecificationActivityClusterGraphGeneratorFactory.java
++++ b/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/client/impl/JobSpecificationActivityClusterGraphGeneratorFactory.java
+@@ -69,6 +69,7 @@ public class JobSpecificationActivityClusterGraphGeneratorFactory implements IAc
+         acg.setFrameSize(spec.getFrameSize());
+         acg.setMaxReattempts(spec.getMaxReattempts());
+         acg.setMaxWarnings(spec.getMaxWarnings());
++        acg.setRequiredNodeMemory(spec.getRequiredNodeMemory());
+         Long resultTtl = (Long) spec.getProperty(HyracksJobProperty.RESULT_TTL);
+         if (resultTtl != null) {
+             // Need to pass request level result ttl to NCs
+diff --git a/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/context/IHyracksJobletContext.java b/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/context/IHyracksJobletContext.java
+index e0dc26c602..60d1a8f8cb 100644
+--- a/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/context/IHyracksJobletContext.java
++++ b/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/context/IHyracksJobletContext.java
+@@ -21,6 +21,7 @@ package org.apache.hyracks.api.context;
+ import org.apache.hyracks.api.application.INCServiceContext;
+ import org.apache.hyracks.api.exceptions.HyracksException;
+ import org.apache.hyracks.api.io.IWorkspaceFileFactory;
++import org.apache.hyracks.api.job.ActivityClusterGraph;
+ import org.apache.hyracks.api.job.IJobletEventListenerFactory;
+ import org.apache.hyracks.api.job.JobId;
+ import org.apache.hyracks.api.job.JobKind;
+@@ -49,4 +50,6 @@ public interface IHyracksJobletContext extends IWorkspaceFileFactory, IDeallocat
+     long nextUniqueId();
+ 
+     JobKind getJobKind();
++
++    ActivityClusterGraph getActivityClusterGraph();
+ }
+diff --git a/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/job/ActivityClusterGraph.java b/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/job/ActivityClusterGraph.java
+index 8982a37de1..302ad833d1 100644
+--- a/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/job/ActivityClusterGraph.java
++++ b/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/job/ActivityClusterGraph.java
+@@ -62,6 +62,8 @@ public class ActivityClusterGraph implements Serializable {
+ 
+     private boolean reportTaskDetails;
+ 
++    private Map<String, Long> requiredNodeMemory;
++
+     public ActivityClusterGraph() {
+         version = 0;
+         activityClusterMap = new HashMap<ActivityClusterId, ActivityCluster>();
+@@ -171,6 +173,14 @@ public class ActivityClusterGraph implements Serializable {
+         this.reportTaskDetails = reportTaskDetails;
+     }
+ 
++    public Map<String, Long> getRequiredNodeMemory() {
++        return requiredNodeMemory;
++    }
++
++    public void setRequiredNodeMemory(Map<String, Long> requiredNodeMemory) {
++        this.requiredNodeMemory = requiredNodeMemory;
++    }
++
+     public List<IConnectorDescriptor> getActivityInputs(ActivityId activityId) {
+         ActivityCluster ac = activityMap.get(activityId);
+         return ac.getActivityInputMap().get(activityId);
+diff --git a/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/job/JobSpecification.java b/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/job/JobSpecification.java
+index 7761ceca8e..a1a11bb8a3 100644
+--- a/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/job/JobSpecification.java
++++ b/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/job/JobSpecification.java
+@@ -92,6 +92,8 @@ public class JobSpecification implements Serializable, IOperatorDescriptorRegist
+ 
+     private IClusterCapacity requiredClusterCapacity;
+ 
++    private Map<String, Long> requiredNodeMemory;
++
+     private transient int operatorIdCounter;
+ 
+     private transient int connectorIdCounter;
+@@ -332,6 +334,14 @@ public class JobSpecification implements Serializable, IOperatorDescriptorRegist
+         return requiredClusterCapacity;
+     }
+ 
++    public void setRequiredNodeMemory(Map<String, Long> requiredNodeMemory) {
++        this.requiredNodeMemory = requiredNodeMemory;
++    }
++
++    public Map<String, Long> getRequiredNodeMemory() {
++        return requiredNodeMemory;
++    }
++
+     public void setMetaOps(List<IOperatorDescriptor> metaOps) {
+         this.metaOps = metaOps;
+     }
+diff --git a/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/resources/memory/IResourceBroker.java b/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/resources/memory/IResourceBroker.java
+new file mode 100644
+index 0000000000..3717f7890d
+--- /dev/null
++++ b/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/resources/memory/IResourceBroker.java
+@@ -0,0 +1,67 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.api.resources.memory;
++
++import org.apache.hyracks.api.context.IHyracksJobletContext;
++import org.apache.hyracks.api.exceptions.HyracksDataException;
++
++/**
++ * Hands out operator memory on a node in frames and moves it between running operators.
++ */
++public interface IResourceBroker {
++
++    /**
++     * Registers an operator whose budget can grow and be cut. It starts at, and is never cut below, minFrames.
++     * Blocks until the frames are available.
++     */
++    OperatorMemoryHandle registerOperator(IHyracksJobletContext ctx, int minFrames) throws HyracksDataException;
++
++    /**
++     * Removes the operator and returns all of its frames.
++     */
++    void deregisterOperator(OperatorMemoryHandle handle);
++
++    /**
++     * Registers an operator with a fixed budget that is never cut. Blocks until the frames are available.
++     */
++    OperatorMemoryHandle registerStaticOperator(IHyracksJobletContext ctx, int frames) throws HyracksDataException;
++
++    /**
++     * Removes a fixed budget operator and returns its frames.
++     */
++    void deregisterStaticOperator(OperatorMemoryHandle handle);
++
++    /**
++     * Asks for more frames, which may cut other operators and wait for them.
++     *
++     * @return the frames granted or 0 if denied
++     */
++    int requestMemory(OperatorMemoryHandle handle, int frames) throws HyracksDataException;
++
++    /**
++     * Lowers the operator's own budget voluntarily.
++     */
++    void releaseMemory(OperatorMemoryHandle handle, int newBudgetFrames);
++
++    /**
++     * Reports the frames the operator still holds after its budget was cut, so the frames it gave up can be
++     * used by the broker.
++     */
++    void acknowledgeBudget(OperatorMemoryHandle handle, int heldFrames);
++}
+diff --git a/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/resources/memory/OperatorMemoryHandle.java b/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/resources/memory/OperatorMemoryHandle.java
+new file mode 100644
+index 0000000000..a6c4b7584f
+--- /dev/null
++++ b/hyracks-fullstack/hyracks/hyracks-api/src/main/java/org/apache/hyracks/api/resources/memory/OperatorMemoryHandle.java
+@@ -0,0 +1,57 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.api.resources.memory;
++
++public final class OperatorMemoryHandle {
++
++    private volatile int budgetFrames;
++    private volatile int easyFrames;
++    private volatile int mediumFrames;
++    private volatile int hardFrames;
++
++    public OperatorMemoryHandle(int budgetFrames) {
++        this.budgetFrames = budgetFrames;
++    }
++
++    public int getBudgetFrames() {
++        return budgetFrames;
++    }
++
++    public void setBudgetFrames(int budgetFrames) {
++        this.budgetFrames = budgetFrames;
++    }
++
++    public int getEasyFrames() {
++        return easyFrames;
++    }
++
++    public int getMediumFrames() {
++        return mediumFrames;
++    }
++
++    public int getHardFrames() {
++        return hardFrames;
++    }
++
++    public void setFrames(int easyFrames, int mediumFrames, int hardFrames) {
++        this.easyFrames = easyFrames;
++        this.mediumFrames = mediumFrames;
++        this.hardFrames = hardFrames;
++    }
++}
+diff --git a/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/application/NCServiceContext.java b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/application/NCServiceContext.java
+index 1a6d0fe370..edff86e10a 100644
+--- a/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/application/NCServiceContext.java
++++ b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/application/NCServiceContext.java
+@@ -31,6 +31,7 @@ import org.apache.hyracks.api.job.JobKind;
+ import org.apache.hyracks.api.lifecycle.ILifeCycleComponentManager;
+ import org.apache.hyracks.api.resources.memory.IFrameProfiler;
+ import org.apache.hyracks.api.resources.memory.IMemoryManager;
++import org.apache.hyracks.api.resources.memory.IResourceBroker;
+ import org.apache.hyracks.api.service.IControllerService;
+ import org.apache.hyracks.control.common.application.ServiceContext;
+ import org.apache.hyracks.control.common.context.ServerContext;
+@@ -52,6 +53,7 @@ public class NCServiceContext extends ServiceContext implements INCServiceContex
+     private IChannelInterfaceFactory messagingChannelInterfaceFactory;
+     private final ITracer tracer;
+     private IFrameProfiler frameProfiler = IFrameProfiler.NOOP_FRAME_PROFILER;
++    private IResourceBroker resourceBroker;
+     private Function<JobKind, IVSizeFrameFactory> vSizeFrameFactoryProvider = kind -> IVSizeFrameFactory.DEFAULT;
+ 
+     public NCServiceContext(NodeControllerService ncs, ServerContext serverCtx, IOManager ioManager, String nodeId,
+@@ -136,6 +138,16 @@ public class NCServiceContext extends ServiceContext implements INCServiceContex
+         this.frameProfiler = frameProfiler;
+     }
+ 
++    @Override
++    public IResourceBroker getResourceBroker() {
++        return resourceBroker;
++    }
++
++    @Override
++    public void setResourceBroker(IResourceBroker resourceBroker) {
++        this.resourceBroker = resourceBroker;
++    }
++
+     @Override
+     public void setVSizeFrameFactoryProvider(Function<JobKind, IVSizeFrameFactory> provider) {
+         this.vSizeFrameFactoryProvider = provider;
+diff --git a/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/GrantStrategy.java b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/GrantStrategy.java
+new file mode 100644
+index 0000000000..f48a994489
+--- /dev/null
++++ b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/GrantStrategy.java
+@@ -0,0 +1,50 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.control.nc.resources.memory;
++
++import java.util.Collection;
++import java.util.Map;
++
++import org.apache.hyracks.api.resources.memory.OperatorMemoryHandle;
++import org.apache.hyracks.control.nc.resources.memory.ResourceBroker.OperatorEntry;
++
++public class GrantStrategy implements IBrokerStrategy {
++
++    @Override
++    public boolean isOperatorAllowedToGrow(OperatorEntry requester, int frames, ResourceBroker broker) {
++        return true;
++    }
++
++    @Override
++    public Map<OperatorMemoryHandle, Integer> selectVictims(OperatorEntry requester, int framesNeeded,
++            Collection<OperatorEntry> operators, ResourceBroker broker) {
++        return Map.of();
++    }
++
++    @Override
++    public Map<OperatorMemoryHandle, Integer> selectVictimsAfterGrant(OperatorEntry requester,
++            Collection<OperatorEntry> operators, ResourceBroker broker) {
++        return Map.of();
++    }
++
++    @Override
++    public boolean shouldRequesterWait(OperatorEntry requester, int frames, ResourceBroker broker) {
++        return false;
++    }
++}
+diff --git a/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/IBrokerStrategy.java b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/IBrokerStrategy.java
+new file mode 100644
+index 0000000000..08b5ceaf8b
+--- /dev/null
++++ b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/IBrokerStrategy.java
+@@ -0,0 +1,57 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.control.nc.resources.memory;
++
++import java.util.Collection;
++import java.util.Map;
++
++import org.apache.hyracks.api.resources.memory.OperatorMemoryHandle;
++import org.apache.hyracks.control.nc.resources.memory.ResourceBroker.OperatorEntry;
++
++/**
++ * Decides who gives up memory when the broker runs short.
++ */
++public interface IBrokerStrategy {
++
++    /**
++     * Decides whether the requester may get more frames at all, before anything is granted.
++     */
++    boolean isOperatorAllowedToGrow(OperatorEntry requester, int frames, ResourceBroker broker);
++
++    /**
++     * Picks operators to cut when free memory cannot cover a request.
++     *
++     * @return the frames to take from each victim, or an empty map for none
++     */
++    Map<OperatorMemoryHandle, Integer> selectVictims(OperatorEntry requester, int framesNeeded,
++            Collection<OperatorEntry> operators, ResourceBroker broker);
++
++    /**
++     * Picks operators to cut after a grant.
++     *
++     * @return the frames to take from each victim, or an empty map for none
++     */
++    Map<OperatorMemoryHandle, Integer> selectVictimsAfterGrant(OperatorEntry requester,
++            Collection<OperatorEntry> operators, ResourceBroker broker);
++
++    /**
++     * Decides whether the requester waits for its victims to give memory back, or gives up and spills.
++     */
++    boolean shouldRequesterWait(OperatorEntry requester, int frames, ResourceBroker broker);
++}
+diff --git a/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/NoWaitStrategy.java b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/NoWaitStrategy.java
+new file mode 100644
+index 0000000000..c73d93b183
+--- /dev/null
++++ b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/NoWaitStrategy.java
+@@ -0,0 +1,29 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.control.nc.resources.memory;
++
++import org.apache.hyracks.control.nc.resources.memory.ResourceBroker.OperatorEntry;
++
++public class NoWaitStrategy extends VictimizeStrategy {
++
++    @Override
++    public boolean shouldRequesterWait(OperatorEntry requester, int frames, ResourceBroker broker) {
++        return false;
++    }
++}
+diff --git a/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/ReserveStrategy.java b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/ReserveStrategy.java
+new file mode 100644
+index 0000000000..c3d2222b6a
+--- /dev/null
++++ b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/ReserveStrategy.java
+@@ -0,0 +1,53 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.control.nc.resources.memory;
++
++import java.util.Collection;
++import java.util.Map;
++
++import org.apache.hyracks.api.resources.memory.OperatorMemoryHandle;
++import org.apache.hyracks.control.nc.resources.memory.ResourceBroker.OperatorEntry;
++
++public class ReserveStrategy extends VictimizeStrategy {
++
++    private final int reservePercent;
++
++    public ReserveStrategy(int reservePercent) {
++        if (reservePercent < 0 || reservePercent >= 100) {
++            throw new IllegalArgumentException("reserve percent must be between 0 and 99: " + reservePercent);
++        }
++        this.reservePercent = reservePercent;
++    }
++
++    @Override
++    public Map<OperatorMemoryHandle, Integer> selectVictimsAfterGrant(OperatorEntry requester,
++            Collection<OperatorEntry> operators, ResourceBroker broker) {
++        int reserveFrames = (int) ((long) broker.getTotalFrames() * reservePercent / 100);
++        int missingFrames = reserveFrames - broker.getFreeFrames() - broker.getOwedFrames();
++        if (missingFrames <= 0) {
++            return Map.of();
++        }
++        return selectVictims(requester, missingFrames, operators, broker);
++    }
++
++    @Override
++    public boolean shouldRequesterWait(OperatorEntry requester, int frames, ResourceBroker broker) {
++        return false;
++    }
++}
+diff --git a/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/ResourceBroker.java b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/ResourceBroker.java
+new file mode 100644
+index 0000000000..991235bc46
+--- /dev/null
++++ b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/ResourceBroker.java
+@@ -0,0 +1,460 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.control.nc.resources.memory;
++
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.Deque;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.function.ToIntFunction;
++
++import org.apache.hyracks.api.context.IHyracksJobletContext;
++import org.apache.hyracks.api.exceptions.ErrorCode;
++import org.apache.hyracks.api.exceptions.HyracksDataException;
++import org.apache.hyracks.api.job.ActivityClusterGraph;
++import org.apache.hyracks.api.job.JobId;
++import org.apache.hyracks.api.resources.memory.IResourceBroker;
++import org.apache.hyracks.api.resources.memory.OperatorMemoryHandle;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++public class ResourceBroker implements IResourceBroker {
++
++    private static final Logger LOGGER = LogManager.getLogger();
++    private static final long MEMORY_WAIT_TIMEOUT_MILLIS = 5000;
++
++    // operators that can grow and be cut, and operators with a fixed budget
++    private final Map<OperatorMemoryHandle, OperatorEntry> operators = new LinkedHashMap<>();
++    private final Map<OperatorMemoryHandle, OperatorEntry> staticOperators = new HashMap<>();
++
++    // operators waiting to grow and new jobs waiting to start, arrivals are always served first
++    private final Deque<OperatorEntry> requestorLine = new ArrayDeque<>();
++    private final Deque<Admission> arrivalLine = new ArrayDeque<>();
++
++    // frames each job set aside on this node, and jobs still setting theirs aside
++    private final Map<JobId, Integer> queryReserves = new HashMap<>();
++    private final Set<JobId> openingQueries = new HashSet<>();
++
++    private final IBrokerStrategy strategy;
++    private final int totalFrames;
++    private final int fairShareFrames;
++    private int freeFrames;
++
++    public ResourceBroker(int totalFrames, int multiprogrammingLevel, IBrokerStrategy strategy) {
++        this.totalFrames = totalFrames;
++        this.fairShareFrames = totalFrames / multiprogrammingLevel;
++        this.freeFrames = totalFrames;
++        this.strategy = strategy;
++        LOGGER.info("resource broker started with {} frames, fair share {} frames", totalFrames, fairShareFrames);
++    }
++
++    // registers an operator that can grow and be cut, starting at its min
++    @Override
++    public synchronized OperatorMemoryHandle registerOperator(IHyracksJobletContext ctx, int minFrames)
++            throws HyracksDataException {
++        takeMinFramesFromReserveOrFree(ctx, minFrames);
++
++        OperatorMemoryHandle handle = new OperatorMemoryHandle(minFrames);
++        OperatorEntry entry = new OperatorEntry(handle, ctx.getJobId(), minFrames);
++        operators.put(handle, entry);
++        return handle;
++    }
++
++    // removes an operator and gives back everything it held
++    @Override
++    public synchronized void deregisterOperator(OperatorMemoryHandle handle) {
++        OperatorEntry entry = operators.remove(handle);
++        if (entry != null) {
++            returnFramesToReserveAndFree(entry);
++            requestorLine.remove(entry);
++            notifyAll();
++        }
++    }
++
++    // registers an operator with a fixed budget that is never cut
++    @Override
++    public synchronized OperatorMemoryHandle registerStaticOperator(IHyracksJobletContext ctx, int frames)
++            throws HyracksDataException {
++        takeMinFramesFromReserveOrFree(ctx, frames);
++
++        OperatorMemoryHandle handle = new OperatorMemoryHandle(frames);
++        OperatorEntry entry = new OperatorEntry(handle, ctx.getJobId(), frames);
++        staticOperators.put(handle, entry);
++        return handle;
++    }
++
++    // removes a fixed budget operator and gives back its frames
++    @Override
++    public synchronized void deregisterStaticOperator(OperatorMemoryHandle handle) {
++        OperatorEntry entry = staticOperators.remove(handle);
++        if (entry != null) {
++            returnFramesToReserveAndFree(entry);
++            notifyAll();
++        }
++    }
++
++    // gives an operator more frames, takes them from victims, or refuses
++    @Override
++    public synchronized int requestMemory(OperatorMemoryHandle handle, int frames) throws HyracksDataException {
++        OperatorEntry entry = operators.get(handle);
++        // an operator that still owes frames from a cut has to give them back before it can grow
++        if (entry == null || frames <= 0 || entry.owedFrames > 0
++                || !strategy.isOperatorAllowedToGrow(entry, frames, this)) {
++            return 0;
++        }
++
++        // nobody is waiting and it fits, so grant right away
++        if (arrivalLine.isEmpty() && requestorLine.isEmpty() && freeFrames >= frames) {
++            grantMemory(entry, frames);
++            return frames;
++        }
++
++        // not enough, so let the strategy pick victims for what is missing
++        int framesNeeded = frames + framesWaitingRequestors() + framesWaitingArrivals() - freeFrames - getOwedFrames();
++        Map<OperatorMemoryHandle, Integer> victims = Map.of();
++        if (framesNeeded > 0) {
++            victims = strategy.selectVictims(entry, framesNeeded, operators.values(), this);
++            takeFromVictims(entry, victims);
++        }
++
++        // no victims or the strategy says no waiting, so the operator spills on its own
++        if (victims.isEmpty() || !strategy.shouldRequesterWait(entry, frames, this)) {
++            return 0;
++        }
++        return waitForMemory(entry, frames);
++    }
++
++    // operator voluntarily lowers its own budget
++    @Override
++    public synchronized void releaseMemory(OperatorMemoryHandle handle, int newBudgetFrames) {
++        OperatorEntry entry = operators.get(handle);
++        if (entry != null) {
++            lowerBudget(entry, newBudgetFrames);
++        }
++    }
++
++    // operator reports what it holds, so owed frames it no longer holds become free
++    @Override
++    public synchronized void acknowledgeBudget(OperatorMemoryHandle handle, int heldFrames) {
++        OperatorEntry entry = operators.get(handle);
++        if (entry == null) {
++            return;
++        }
++        int stillOwed = Math.min(entry.owedFrames, Math.max(0, heldFrames - entry.budgetFrames));
++        freeFrames += entry.owedFrames - stillOwed;
++        entry.owedFrames = stillOwed;
++        notifyAll();
++    }
++
++    public int getTotalFrames() {
++        return totalFrames;
++    }
++
++    public int getFairShareFrames() {
++        return fairShareFrames;
++    }
++
++    public synchronized int getFreeFrames() {
++        return freeFrames;
++    }
++
++    // frames cut from operators that they have not given back yet
++    public synchronized int getOwedFrames() {
++        int frames = 0;
++        for (OperatorEntry entry : operators.values()) {
++            frames += entry.owedFrames;
++        }
++        return frames;
++    }
++
++    // takes an operator's min from its job's reserve, or from free memory if the job has no reserve
++    private void takeMinFramesFromReserveOrFree(IHyracksJobletContext ctx, int minFrames) throws HyracksDataException {
++        JobId jobId = ctx.getJobId();
++        int queryReserveFrames = getQueryReserveFrames(ctx);
++        if (queryReserveFrames > 0) {
++            ensureQueryReserve(ctx, queryReserveFrames);
++        }
++
++        Integer reserveFrames = queryReserves.get(jobId);
++        if (reserveFrames == null) {
++            waitForAdmission(minFrames);
++            freeFrames -= minFrames;
++        } else if (reserveFrames < minFrames) {
++            throw HyracksDataException.create(ErrorCode.INSUFFICIENT_MEMORY);
++        } else {
++            queryReserves.put(jobId, reserveFrames - minFrames);
++        }
++    }
++
++    // gives an operator's min back to its job's reserve and the rest to free memory
++    private void returnFramesToReserveAndFree(OperatorEntry entry) {
++        int returnedFrames = entry.budgetFrames + entry.owedFrames;
++        Integer reserveFrames = queryReserves.get(entry.jobId);
++        if (reserveFrames != null) {
++            queryReserves.put(entry.jobId, reserveFrames + entry.minFrames);
++            returnedFrames -= entry.minFrames;
++        }
++        freeFrames += returnedFrames;
++    }
++
++    // frames this job asked to set aside on this node, or 0 if none
++    private static int getQueryReserveFrames(IHyracksJobletContext ctx) {
++        ActivityClusterGraph acg = ctx.getActivityClusterGraph();
++        if (acg == null || acg.getRequiredNodeMemory() == null) {
++            return 0;
++        }
++        Long reserveBytes = acg.getRequiredNodeMemory().get(ctx.getServiceContext().getNodeId());
++        if (reserveBytes == null) {
++            return 0;
++        }
++        return (int) Math.min(Integer.MAX_VALUE, reserveBytes / ctx.getInitialFrameSize());
++    }
++
++    // sets aside the job's reserve once, other operators of the same job wait for it
++    private void ensureQueryReserve(IHyracksJobletContext ctx, int reserveFrames) throws HyracksDataException {
++        JobId jobId = ctx.getJobId();
++
++        // another operator of this job is already setting it aside
++        try {
++            while (openingQueries.contains(jobId)) {
++                wait();
++            }
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw HyracksDataException.create(e);
++        }
++        if (queryReserves.containsKey(jobId)) {
++            return;
++        }
++
++        // this operator sets it aside and releases it when the job ends
++        openingQueries.add(jobId);
++        try {
++            waitForAdmission(reserveFrames);
++        } finally {
++            openingQueries.remove(jobId);
++            notifyAll();
++        }
++        freeFrames -= reserveFrames;
++        queryReserves.put(jobId, reserveFrames);
++        ctx.registerDeallocatable(() -> releaseQueryReserve(jobId));
++    }
++
++    // returns whatever is left of a job's reserve when the job ends
++    private synchronized void releaseQueryReserve(JobId jobId) {
++        Integer reserveFrames = queryReserves.remove(jobId);
++        if (reserveFrames != null) {
++            freeFrames += reserveFrames;
++            notifyAll();
++        }
++    }
++
++    // waits until minFrames are free and nobody is ahead in the arrival line
++    private void waitForAdmission(int minFrames) throws HyracksDataException {
++        if (minFrames > totalFrames) {
++            throw HyracksDataException.create(ErrorCode.INSUFFICIENT_MEMORY);
++        }
++
++        Admission admission = new Admission(minFrames);
++        arrivalLine.addLast(admission);
++        try {
++            // cut frames that operators hold above their min to make room
++            int framesNeeded = framesWaitingArrivals() - freeFrames - getOwedFrames();
++            if (framesNeeded > 0) {
++                takeFromVictims(null, selectAdmissionVictims(framesNeeded));
++            }
++
++            while (arrivalLine.peekFirst() != admission || freeFrames < minFrames) {
++                wait();
++            }
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw HyracksDataException.create(e);
++        } finally {
++            arrivalLine.remove(admission);
++            notifyAll();
++        }
++    }
++
++    // waits up to the timeout for the requested frames, first come first served
++    private int waitForMemory(OperatorEntry entry, int frames) throws HyracksDataException {
++        entry.framesWaitingFor = frames;
++        requestorLine.addLast(entry);
++
++        long deadline = System.currentTimeMillis() + MEMORY_WAIT_TIMEOUT_MILLIS;
++        try {
++            while (!arrivalLine.isEmpty() || requestorLine.peekFirst() != entry || freeFrames < frames) {
++                long remainingMillis = deadline - System.currentTimeMillis();
++                if (remainingMillis <= 0 || !operators.containsKey(entry.handle)) {
++                    return 0;
++                }
++                wait(remainingMillis);
++            }
++            grantMemory(entry, frames);
++            return frames;
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw HyracksDataException.create(e);
++        } finally {
++            entry.framesWaitingFor = 0;
++            requestorLine.remove(entry);
++            notifyAll();
++        }
++    }
++
++    // gives free frames to the operator, then asks the strategy if anyone else should be cut
++    private void grantMemory(OperatorEntry entry, int frames) {
++        freeFrames -= frames;
++        entry.budgetFrames += frames;
++        entry.handle.setBudgetFrames(entry.budgetFrames);
++
++        takeFromVictims(entry, strategy.selectVictimsAfterGrant(entry, operators.values(), this));
++    }
++
++    // frames the requestor line is waiting for
++    private int framesWaitingRequestors() {
++        int frames = 0;
++        for (OperatorEntry waiter : requestorLine) {
++            frames += waiter.framesWaitingFor;
++        }
++        return frames;
++    }
++
++    // frames the arrival line is waiting for
++    private int framesWaitingArrivals() {
++        int frames = 0;
++        for (Admission admission : arrivalLine) {
++            frames += admission.minFrames;
++        }
++        return frames;
++    }
++
++    // picks frames above min to cut for an admission, easy first then medium, largest first
++    private Map<OperatorMemoryHandle, Integer> selectAdmissionVictims(int framesNeeded) {
++        List<OperatorEntry> candidates = new ArrayList<>();
++        for (OperatorEntry entry : operators.values()) {
++            if (entry.framesAboveMin() > 0) {
++                candidates.add(entry);
++            }
++        }
++        candidates.sort(Comparator.comparingInt(OperatorEntry::framesAboveMin).reversed());
++
++        Map<OperatorMemoryHandle, Integer> victims = new HashMap<>();
++        int stillNeeded = takeFramesAboveMin(candidates, framesNeeded, OperatorMemoryHandle::getEasyFrames, victims);
++        takeFramesAboveMin(candidates, stillNeeded, OperatorMemoryHandle::getMediumFrames, victims);
++        return victims;
++    }
++
++    // takes up to framesNeeded from the candidates using one grade, returns what is still missing
++    private static int takeFramesAboveMin(List<OperatorEntry> candidates, int framesNeeded,
++            ToIntFunction<OperatorMemoryHandle> takeableFrames, Map<OperatorMemoryHandle, Integer> victims) {
++        for (OperatorEntry candidate : candidates) {
++            if (framesNeeded <= 0) {
++                break;
++            }
++            int framesLeft = candidate.framesAboveMin() - victims.getOrDefault(candidate.handle, 0);
++            int takenFrames = Math.min(framesNeeded, Math.min(takeableFrames.applyAsInt(candidate.handle), framesLeft));
++            if (takenFrames > 0) {
++                victims.merge(candidate.handle, takenFrames, Integer::sum);
++                framesNeeded -= takenFrames;
++            }
++        }
++        return framesNeeded;
++    }
++
++    // cuts each victim's budget by the given frames
++    private void takeFromVictims(OperatorEntry requester, Map<OperatorMemoryHandle, Integer> victims) {
++        for (Map.Entry<OperatorMemoryHandle, Integer> victim : victims.entrySet()) {
++            OperatorEntry entry = operators.get(victim.getKey());
++            if (entry != null && entry != requester && victim.getValue() > 0) {
++                lowerBudget(entry, entry.budgetFrames - victim.getValue());
++            }
++        }
++    }
++
++    // lowers a budget but never below min, the cut frames are owed until the operator acks
++    private void lowerBudget(OperatorEntry entry, int newBudgetFrames) {
++        int newBudget = Math.max(newBudgetFrames, entry.minFrames);
++        if (newBudget < entry.budgetFrames) {
++            entry.owedFrames += entry.budgetFrames - newBudget;
++            entry.budgetFrames = newBudget;
++            entry.handle.setBudgetFrames(newBudget);
++        }
++    }
++
++    // what the broker knows about one operator
++    public static final class OperatorEntry {
++        private final OperatorMemoryHandle handle;
++        private final JobId jobId;
++        private final int minFrames;
++        private int budgetFrames;
++        private int owedFrames;
++        private int framesWaitingFor;
++
++        private OperatorEntry(OperatorMemoryHandle handle, JobId jobId, int minFrames) {
++            this.handle = handle;
++            this.jobId = jobId;
++            this.minFrames = minFrames;
++            this.budgetFrames = minFrames;
++        }
++
++        private int framesAboveMin() {
++            return budgetFrames - minFrames;
++        }
++
++        public OperatorMemoryHandle getHandle() {
++            return handle;
++        }
++
++        public JobId getJobId() {
++            return jobId;
++        }
++
++        public int getMinFrames() {
++            return minFrames;
++        }
++
++        public int getBudgetFrames() {
++            return budgetFrames;
++        }
++
++        public int getOwedFrames() {
++            return owedFrames;
++        }
++
++        public boolean isWaitingForMemory() {
++            return framesWaitingFor > 0;
++        }
++    }
++
++    // a place in the arrival line
++    private static final class Admission {
++        private final int minFrames;
++
++        private Admission(int minFrames) {
++            this.minFrames = minFrames;
++        }
++    }
++}
+diff --git a/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/StopRuleStrategy.java b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/StopRuleStrategy.java
+new file mode 100644
+index 0000000000..433f106c05
+--- /dev/null
++++ b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/StopRuleStrategy.java
+@@ -0,0 +1,37 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.control.nc.resources.memory;
++
++import java.util.Collection;
++import java.util.Map;
++
++import org.apache.hyracks.api.resources.memory.OperatorMemoryHandle;
++import org.apache.hyracks.control.nc.resources.memory.ResourceBroker.OperatorEntry;
++
++public class StopRuleStrategy extends VictimizeStrategy {
++
++    @Override
++    public Map<OperatorMemoryHandle, Integer> selectVictims(OperatorEntry requester, int framesNeeded,
++            Collection<OperatorEntry> operators, ResourceBroker broker) {
++        if (requester.getBudgetFrames() >= broker.getFairShareFrames()) {
++            return Map.of();
++        }
++        return super.selectVictims(requester, framesNeeded, operators, broker);
++    }
++}
+diff --git a/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/TieredStrategy.java b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/TieredStrategy.java
+new file mode 100644
+index 0000000000..61a13c2ace
+--- /dev/null
++++ b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/TieredStrategy.java
+@@ -0,0 +1,52 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.control.nc.resources.memory;
++
++import java.util.Collection;
++import java.util.Map;
++
++import org.apache.hyracks.api.resources.memory.OperatorMemoryHandle;
++import org.apache.hyracks.control.nc.resources.memory.ResourceBroker.OperatorEntry;
++
++public class TieredStrategy extends VictimizeStrategy {
++
++    @Override
++    public Map<OperatorMemoryHandle, Integer> selectVictims(OperatorEntry requester, int framesNeeded,
++            Collection<OperatorEntry> operators, ResourceBroker broker) {
++        int fairShareFrames = broker.getFairShareFrames();
++        OperatorEntry donor = null;
++        int donorEasyFrames = 0;
++        for (OperatorEntry operator : operators) {
++            if (operator.getJobId().equals(requester.getJobId()) || operator.isWaitingForMemory()
++                    || operator.getOwedFrames() > 0) {
++                continue;
++            }
++            int easyFrames = operator.getHandle().getEasyFrames();
++            int takeableFrames = Math.min(easyFrames, operator.getBudgetFrames() - fairShareFrames);
++            if (takeableFrames >= framesNeeded && easyFrames > donorEasyFrames) {
++                donor = operator;
++                donorEasyFrames = easyFrames;
++            }
++        }
++        if (donor == null) {
++            return super.selectVictims(requester, framesNeeded, operators, broker);
++        }
++        return Map.of(donor.getHandle(), framesNeeded);
++    }
++}
+diff --git a/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/VictimizeStrategy.java b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/VictimizeStrategy.java
+new file mode 100644
+index 0000000000..5d20e61adc
+--- /dev/null
++++ b/hyracks-fullstack/hyracks/hyracks-control/hyracks-control-nc/src/main/java/org/apache/hyracks/control/nc/resources/memory/VictimizeStrategy.java
+@@ -0,0 +1,68 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.control.nc.resources.memory;
++
++import java.util.Collection;
++import java.util.Map;
++
++import org.apache.hyracks.api.resources.memory.OperatorMemoryHandle;
++import org.apache.hyracks.control.nc.resources.memory.ResourceBroker.OperatorEntry;
++
++public class VictimizeStrategy implements IBrokerStrategy {
++
++    @Override
++    public boolean isOperatorAllowedToGrow(OperatorEntry requester, int frames, ResourceBroker broker) {
++        return true;
++    }
++
++    @Override
++    public Map<OperatorMemoryHandle, Integer> selectVictims(OperatorEntry requester, int framesNeeded,
++            Collection<OperatorEntry> operators, ResourceBroker broker) {
++        int fairShareFrames = broker.getFairShareFrames();
++        OperatorEntry victim = null;
++        for (OperatorEntry operator : operators) {
++            if (operator.getJobId().equals(requester.getJobId()) || operator.isWaitingForMemory()
++                    || operator.getOwedFrames() > 0) {
++                continue;
++            }
++            OperatorMemoryHandle handle = operator.getHandle();
++            int framesAboveFairShare = operator.getBudgetFrames() - fairShareFrames;
++            int takeableFrames = Math.min(framesAboveFairShare, handle.getEasyFrames() + handle.getMediumFrames());
++            if (takeableFrames >= framesNeeded
++                    && (victim == null || operator.getBudgetFrames() > victim.getBudgetFrames())) {
++                victim = operator;
++            }
++        }
++        if (victim == null) {
++            return Map.of();
++        }
++        return Map.of(victim.getHandle(), framesNeeded);
++    }
++
++    @Override
++    public Map<OperatorMemoryHandle, Integer> selectVictimsAfterGrant(OperatorEntry requester,
++            Collection<OperatorEntry> operators, ResourceBroker broker) {
++        return Map.of();
++    }
++
++    @Override
++    public boolean shouldRequesterWait(OperatorEntry requester, int frames, ResourceBroker broker) {
++        return true;
++    }
++}
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/DeallocatableFramePool.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/DeallocatableFramePool.java
+index 47b11ce8c5..c83abcac0d 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/DeallocatableFramePool.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/DeallocatableFramePool.java
+@@ -28,10 +28,10 @@ import org.apache.hyracks.api.exceptions.HyracksDataException;
+ 
+ public class DeallocatableFramePool implements IDeallocatableFramePool {
+ 
+-    private final IHyracksFrameMgrContext ctx;
+-    private final int memBudget;
+-    private int allocated;
+-    private LinkedList<ByteBuffer> buffers;
++    protected final IHyracksFrameMgrContext ctx;
++    protected int memBudget;
++    protected int allocated;
++    protected LinkedList<ByteBuffer> buffers;
+ 
+     public DeallocatableFramePool(IHyracksFrameMgrContext ctx, int memBudgetInBytes) {
+         this.ctx = ctx;
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/DeallocatableFramePoolDynamicBudget.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/DeallocatableFramePoolDynamicBudget.java
+new file mode 100644
+index 0000000000..ca7647801a
+--- /dev/null
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/DeallocatableFramePoolDynamicBudget.java
+@@ -0,0 +1,131 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.dataflow.std.buffermanager;
++
++import java.nio.ByteBuffer;
++
++import org.apache.hyracks.api.context.IHyracksJobletContext;
++import org.apache.hyracks.api.exceptions.HyracksDataException;
++import org.apache.hyracks.api.resources.memory.IResourceBroker;
++import org.apache.hyracks.api.resources.memory.OperatorMemoryHandle;
++
++public class DeallocatableFramePoolDynamicBudget extends DeallocatableFramePool {
++
++    private final IResourceBroker broker;
++    private final OperatorMemoryHandle handle;
++    private int acknowledgedBudget;
++
++    public DeallocatableFramePoolDynamicBudget(IHyracksJobletContext ctx, int memBudgetInBytes, int minFrames)
++            throws HyracksDataException {
++        super(ctx, memBudgetInBytes);
++        broker = ctx.getServiceContext().getResourceBroker();
++        if (broker != null) {
++            OperatorMemoryHandle registered = broker.registerOperator(ctx, minFrames);
++            ctx.registerDeallocatable(() -> broker.deregisterOperator(registered));
++            handle = registered;
++            memBudget = toBytes(handle.getBudgetFrames());
++            acknowledgedBudget = memBudget;
++        } else {
++            handle = null;
++        }
++    }
++
++    public int syncBudgetWithBroker() {
++        if (handle == null) {
++            return 0;
++        }
++        memBudget = toBytes(handle.getBudgetFrames());
++        while (allocated > memBudget && !buffers.isEmpty()) {
++            ByteBuffer idle = buffers.removeFirst();
++            ctx.deallocateFrames(idle.capacity());
++            allocated -= idle.capacity();
++        }
++        int framesToSpill = toFrames(Math.max(0, allocated - memBudget));
++        if (framesToSpill == 0 && memBudget != acknowledgedBudget) {
++            acknowledgeBudget();
++        }
++        return framesToSpill;
++    }
++
++    public int requestMemory(int frames) throws HyracksDataException {
++        if (handle == null) {
++            return 0;
++        }
++        int granted = broker.requestMemory(handle, frames);
++        memBudget = toBytes(handle.getBudgetFrames());
++        return granted;
++    }
++
++    public void releaseMemory(int newBudgetFrames) {
++        if (handle != null && newBudgetFrames < getBudgetFrames()) {
++            broker.releaseMemory(handle, newBudgetFrames);
++            memBudget = toBytes(handle.getBudgetFrames());
++            acknowledgeBudget();
++        }
++    }
++
++    public void acknowledgeBudget() {
++        if (handle != null) {
++            acknowledgedBudget = memBudget;
++            broker.acknowledgeBudget(handle, toFrames(allocated));
++        }
++    }
++
++    public void reportUsage(int easyFrames, int mediumFrames, int hardFrames) {
++        if (handle != null) {
++            int freeFrames = toFrames(Math.max(0, memBudget - allocated)) + buffers.size();
++            handle.setFrames(easyFrames + freeFrames, mediumFrames, hardFrames);
++        }
++    }
++
++    public int getHeldFrames() {
++        return toFrames(allocated) - buffers.size();
++    }
++
++    public int getBudgetFrames() {
++        return toFrames(memBudget);
++    }
++
++    private int toFrames(int bytes) {
++        return bytes / ctx.getInitialFrameSize();
++    }
++
++    private int toBytes(int frames) {
++        int frameSize = ctx.getInitialFrameSize();
++        return Math.min(frames, Integer.MAX_VALUE / frameSize) * frameSize;
++    }
++
++    @Override
++    public void deAllocateBuffer(ByteBuffer buffer) {
++        if (buffer.capacity() != ctx.getInitialFrameSize() || allocated > memBudget) {
++            ctx.deallocateFrames(buffer.capacity());
++            allocated -= buffer.capacity();
++        } else {
++            buffers.add(buffer);
++        }
++    }
++
++    @Override
++    public void close() {
++        super.close();
++        if (handle != null) {
++            broker.deregisterOperator(handle);
++        }
++    }
++}
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/DeallocatableFramePoolStaticBudget.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/DeallocatableFramePoolStaticBudget.java
+new file mode 100644
+index 0000000000..cf934721b5
+--- /dev/null
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/DeallocatableFramePoolStaticBudget.java
+@@ -0,0 +1,53 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.dataflow.std.buffermanager;
++
++import org.apache.hyracks.api.context.IHyracksTaskContext;
++import org.apache.hyracks.api.exceptions.HyracksDataException;
++import org.apache.hyracks.api.resources.memory.IResourceBroker;
++import org.apache.hyracks.api.resources.memory.OperatorMemoryHandle;
++
++public class DeallocatableFramePoolStaticBudget extends DeallocatableFramePool {
++
++    private final IResourceBroker broker;
++    private final OperatorMemoryHandle handle;
++
++    public DeallocatableFramePoolStaticBudget(IHyracksTaskContext ctx, int memBudgetInBytes)
++            throws HyracksDataException {
++        super(ctx, memBudgetInBytes);
++        broker = ctx.getJobletContext().getServiceContext().getResourceBroker();
++        if (broker != null) {
++            OperatorMemoryHandle registered =
++                    broker.registerStaticOperator(ctx.getJobletContext(), memBudgetInBytes / ctx.getInitialFrameSize());
++            // released at job end, not task end, since frames can be handed to the next task
++            ctx.getJobletContext().registerDeallocatable(() -> broker.deregisterStaticOperator(registered));
++            handle = registered;
++        } else {
++            handle = null;
++        }
++    }
++
++    @Override
++    public void close() {
++        super.close();
++        if (handle != null) {
++            broker.deregisterStaticOperator(handle);
++        }
++    }
++}
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/VPartitionTupleBufferManager.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/VPartitionTupleBufferManager.java
+index 9cabb8a1b6..0563043465 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/VPartitionTupleBufferManager.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/VPartitionTupleBufferManager.java
+@@ -200,6 +200,7 @@ public class VPartitionTupleBufferManager implements IPartitionedTupleBufferMana
+         if (newBuffer == null) {
+             return -1;
+         }
++        FrameHelper.serializeFrameSize(newBuffer, newBuffer.capacity() / framePool.getMinFrameSize());
+         appendFrame.reset(newBuffer);
+         appender.reset(appendFrame, true);
+         return partitionArray[partition].insertFrame(newBuffer);
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/VariableFramePoolStaticBudget.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/VariableFramePoolStaticBudget.java
+new file mode 100644
+index 0000000000..5bdbaf710b
+--- /dev/null
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/buffermanager/VariableFramePoolStaticBudget.java
+@@ -0,0 +1,52 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hyracks.dataflow.std.buffermanager;
++
++import org.apache.hyracks.api.context.IHyracksTaskContext;
++import org.apache.hyracks.api.exceptions.HyracksDataException;
++import org.apache.hyracks.api.resources.memory.IResourceBroker;
++import org.apache.hyracks.api.resources.memory.OperatorMemoryHandle;
++
++public class VariableFramePoolStaticBudget extends VariableFramePool {
++
++    private final IResourceBroker broker;
++    private final OperatorMemoryHandle handle;
++
++    public VariableFramePoolStaticBudget(IHyracksTaskContext ctx, int memBudgetInBytes) throws HyracksDataException {
++        super(ctx, memBudgetInBytes);
++        broker = ctx.getJobletContext().getServiceContext().getResourceBroker();
++        if (broker != null) {
++            OperatorMemoryHandle registered =
++                    broker.registerStaticOperator(ctx.getJobletContext(), memBudgetInBytes / ctx.getInitialFrameSize());
++            // released at job end, not task end, since frames can be handed to the next task
++            ctx.getJobletContext().registerDeallocatable(() -> broker.deregisterStaticOperator(registered));
++            handle = registered;
++        } else {
++            handle = null;
++        }
++    }
++
++    @Override
++    public void close() {
++        super.close();
++        if (handle != null) {
++            broker.deregisterStaticOperator(handle);
++        }
++    }
++}
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/group/HashSpillableTableFactory.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/group/HashSpillableTableFactory.java
+index 6d64eddcfa..5eee324a4c 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/group/HashSpillableTableFactory.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/group/HashSpillableTableFactory.java
+@@ -33,7 +33,7 @@ import org.apache.hyracks.api.exceptions.HyracksDataException;
+ import org.apache.hyracks.dataflow.common.comm.io.ArrayTupleBuilder;
+ import org.apache.hyracks.dataflow.common.comm.io.FrameTupleAppender;
+ import org.apache.hyracks.dataflow.common.data.partition.FieldHashPartitionComputerFamily;
+-import org.apache.hyracks.dataflow.std.buffermanager.DeallocatableFramePool;
++import org.apache.hyracks.dataflow.std.buffermanager.DeallocatableFramePoolStaticBudget;
+ import org.apache.hyracks.dataflow.std.buffermanager.FramePoolBackedFrameBufferManager;
+ import org.apache.hyracks.dataflow.std.buffermanager.IDeallocatableFramePool;
+ import org.apache.hyracks.dataflow.std.buffermanager.IPartitionedTupleBufferManager;
+@@ -141,7 +141,7 @@ public class HashSpillableTableFactory implements ISpillableTableFactory {
+             private final BitSet spilledSet = new BitSet(numPartitions);
+             // This frame pool will be shared by both data table and hash table.
+             private final IDeallocatableFramePool framePool =
+-                    new DeallocatableFramePool(ctx, framesLimit * ctx.getInitialFrameSize());
++                    new DeallocatableFramePoolStaticBudget(ctx, framesLimit * ctx.getInitialFrameSize());
+             // buffer manager for hash table
+             private final ISimpleFrameBufferManager bufferManagerForHashTable =
+                     new FramePoolBackedFrameBufferManager(framePool);
+@@ -165,6 +165,7 @@ public class HashSpillableTableFactory implements ISpillableTableFactory {
+             public void close() throws HyracksDataException {
+                 hashTableForTuplePointer.close();
+                 aggregator.close();
++                bufferManager.close();
+             }
+ 
+             @Override
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/InMemoryHashJoin.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/InMemoryHashJoin.java
+index d5377c2fc6..4a93bc25f9 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/InMemoryHashJoin.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/InMemoryHashJoin.java
+@@ -54,13 +54,13 @@ public class InMemoryHashJoin {
+     private ITuplePairComparator tpComparator;
+     private final boolean isLeftOuter;
+     private final ArrayTupleBuilder missingTupleBuild;
+-    private final ISerializableTable table;
++    private ISerializableTable table;
+     private final TuplePointer storedTuplePointer;
+     private final boolean reverseOutputOrder; //Should we reverse the order of tuples, we are writing in output
+     private final TupleInFrameListAccessor tupleAccessor;
+     // To release frames
+     private final ISimpleFrameBufferManager bufferManager;
+-    private final boolean isTableCapacityNotZero;
++    private boolean isTableCapacityNotZero;
+ 
+     private static final Logger LOGGER = LogManager.getLogger();
+ 
+@@ -220,6 +220,12 @@ public class InMemoryHashJoin {
+         table.close();
+     }
+ 
++    public void resetTable(ISerializableTable newTable) throws HyracksDataException {
++        table = newTable;
++        isTableCapacityNotZero = newTable.getTableSize() != 0;
++        buffers.clear();
++    }
++
+     private void appendToResult(int probeSidetIx, int buildSidetIx, IFrameWriter writer) throws HyracksDataException {
+         if (reverseOutputOrder) {
+             FrameUtils.appendConcatToWriter(writer, appender, accessorBuild, buildSidetIx, accessorProbe, probeSidetIx);
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/InMemoryHashJoinOperatorDescriptor.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/InMemoryHashJoinOperatorDescriptor.java
+index 345952ac97..b7ed54151b 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/InMemoryHashJoinOperatorDescriptor.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/InMemoryHashJoinOperatorDescriptor.java
+@@ -47,7 +47,7 @@ import org.apache.hyracks.dataflow.std.base.AbstractOperatorDescriptor;
+ import org.apache.hyracks.dataflow.std.base.AbstractStateObject;
+ import org.apache.hyracks.dataflow.std.base.AbstractUnaryInputSinkOperatorNodePushable;
+ import org.apache.hyracks.dataflow.std.base.AbstractUnaryInputUnaryOutputOperatorNodePushable;
+-import org.apache.hyracks.dataflow.std.buffermanager.DeallocatableFramePool;
++import org.apache.hyracks.dataflow.std.buffermanager.DeallocatableFramePoolStaticBudget;
+ import org.apache.hyracks.dataflow.std.buffermanager.FramePoolBackedFrameBufferManager;
+ import org.apache.hyracks.dataflow.std.buffermanager.IDeallocatableFramePool;
+ import org.apache.hyracks.dataflow.std.buffermanager.ISimpleFrameBufferManager;
+@@ -156,7 +156,7 @@ public class InMemoryHashJoinOperatorDescriptor extends AbstractOperatorDescript
+             }
+ 
+             final int memSizeInBytes = memSizeInFrames * jobletCtx.getInitialFrameSize();
+-            final IDeallocatableFramePool framePool = new DeallocatableFramePool(jobletCtx, memSizeInBytes);
++            final IDeallocatableFramePool framePool = new DeallocatableFramePoolStaticBudget(ctx, memSizeInBytes);
+             final ISimpleFrameBufferManager bufferManager = new FramePoolBackedFrameBufferManager(framePool);
+ 
+             IOperatorNodePushable op = new AbstractUnaryInputSinkOperatorNodePushable() {
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/MemoryContentionResponsiveHHJ.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/MemoryContentionResponsiveHHJ.java
+new file mode 100644
+index 0000000000..eaa5b2766f
+--- /dev/null
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/MemoryContentionResponsiveHHJ.java
+@@ -0,0 +1,168 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.hyracks.dataflow.std.join;
++
++import java.nio.ByteBuffer;
++
++import org.apache.hyracks.api.comm.IFrameWriter;
++import org.apache.hyracks.api.context.IHyracksJobletContext;
++import org.apache.hyracks.api.dataflow.value.IMissingWriterFactory;
++import org.apache.hyracks.api.dataflow.value.IPredicateEvaluator;
++import org.apache.hyracks.api.dataflow.value.ITuplePartitionComputer;
++import org.apache.hyracks.api.dataflow.value.RecordDescriptor;
++import org.apache.hyracks.api.exceptions.HyracksDataException;
++import org.apache.hyracks.dataflow.std.buffermanager.DeallocatableFramePoolDynamicBudget;
++import org.apache.hyracks.dataflow.std.structures.SerializableHashTable;
++
++public class MemoryContentionResponsiveHHJ extends OptimizedHybridHashJoin {
++
++    private static final int MEMORY_REQUEST_FRAMES = 128;
++    private static final int PROBE_BUFFER_PERCENT = 10;
++    private DeallocatableFramePoolDynamicBudget framePool;
++
++    public MemoryContentionResponsiveHHJ(IHyracksJobletContext jobletCtx, int memSizeInFrames, int numOfPartitions,
++            String probeRelName, String buildRelName, RecordDescriptor probeRd, RecordDescriptor buildRd,
++            ITuplePartitionComputer probeHpc, ITuplePartitionComputer buildHpc, IPredicateEvaluator probePredEval,
++            IPredicateEvaluator buildPredEval, boolean isLeftOuter, IMissingWriterFactory[] nullWriterFactories1) {
++        super(jobletCtx, memSizeInFrames, numOfPartitions, probeRelName, buildRelName, probeRd, buildRd, probeHpc,
++                buildHpc, probePredEval, buildPredEval, isLeftOuter, nullWriterFactories1);
++    }
++
++    @Override
++    public void initBuild() throws HyracksDataException {
++        // one frame per partition is the least a join can run with, twice that gives it room to start
++        int minFrames = Math.max(numOfPartitions, Math.min(2 * numOfPartitions, memSizeInFrames));
++        framePool = new DeallocatableFramePoolDynamicBudget(jobletCtx,
++                memSizeInFrames * jobletCtx.getInitialFrameSize(), minFrames);
++        initBuildInternal(framePool);
++    }
++
++    @Override
++    public void build(ByteBuffer buffer) throws HyracksDataException {
++        adjustMemory(false);
++        super.build(buffer);
++    }
++
++    @Override
++    protected void processTupleBuildPhase(int tid, int pid) throws HyracksDataException {
++        if (bufferManager.insertTuple(pid, accessorBuild, tid, tempPtr)) {
++            return;
++        }
++        if (!spilledStatus.get(pid)) {
++            int granted = framePool.requestMemory(MEMORY_REQUEST_FRAMES);
++            if (granted > 0) {
++                memSizeInFrames = framePool.getBudgetFrames();
++            }
++        }
++        super.processTupleBuildPhase(tid, pid);
++    }
++
++    @Override
++    public void closeBuild() throws HyracksDataException {
++        adjustMemory(false);
++        requestHashTableMemory();
++        super.closeBuild();
++        int heldFrames = framePool.getHeldFrames();
++        int probeBufferFrames = Math.max(spilledStatus.cardinality(), heldFrames * PROBE_BUFFER_PERCENT / 100);
++        framePool.releaseMemory(heldFrames + probeBufferFrames);
++        memSizeInFrames = framePool.getBudgetFrames();
++        reportUsage(true);
++    }
++
++    private void requestHashTableMemory() throws HyracksDataException {
++        FreeSpace fs = calculateFreeSpace();
++        if (fs.freeSpace < 0) {
++            int frameSize = jobletCtx.getInitialFrameSize();
++            int shortfallFrames = (int) ((-fs.freeSpace + frameSize - 1) / frameSize);
++            int granted = framePool.requestMemory(shortfallFrames);
++            if (granted > 0) {
++                memSizeInFrames = framePool.getBudgetFrames();
++            }
++        }
++    }
++
++    @Override
++    public void probe(ByteBuffer buffer, IFrameWriter writer) throws HyracksDataException {
++        adjustMemory(true);
++        super.probe(buffer, writer);
++    }
++
++    private void adjustMemory(boolean isProbing) throws HyracksDataException {
++        int framesToSpill = framePool.syncBudgetWithBroker();
++        memSizeInFrames = framePool.getBudgetFrames();
++        if (framesToSpill > 0) {
++            if (isProbing) {
++                spillProbePhase(framesToSpill);
++            } else {
++                spillBuildPhase(framesToSpill);
++            }
++            framePool.acknowledgeBudget();
++        }
++        reportUsage(isProbing);
++    }
++
++    private void reportUsage(boolean isProbing) {
++        int heldFrames = framePool.getHeldFrames();
++        if (isProbing) {
++            framePool.reportUsage(0, 0, heldFrames);
++        } else {
++            framePool.reportUsage(0, heldFrames, 0);
++        }
++    }
++
++    private void spillBuildPhase(int framesToSpill) throws HyracksDataException {
++        int freedFrames = 0;
++        while (freedFrames < framesToSpill) {
++            int victim = spillPolicy.findSpilledPartitionWithMaxMemoryUsage();
++            if (victim < 0) {
++                victim = spillPolicy.findInMemPartitionWithMaxMemoryUsage();
++            }
++            if (victim < 0) {
++                break;
++            }
++            freedFrames += bufferManager.getPhysicalSize(victim) / jobletCtx.getInitialFrameSize();
++            spillPartition(victim);
++        }
++    }
++
++    private void spillProbePhase(int framesToSpill) throws HyracksDataException {
++        int freedFrames = 0;
++        while (freedFrames < framesToSpill || calculateFreeSpace().freeSpace < 0) {
++            int victim = spillPolicy.findInMemPartitionWithMaxMemoryUsage();
++            if (victim < 0 || buildPSizeInTups[victim] <= 0) {
++                break;
++            }
++            freedFrames += bufferManager.getPhysicalSize(victim) / jobletCtx.getInitialFrameSize();
++            spillPartition(victim);
++            closeBuildPartition(victim);
++        }
++        if (freedFrames > 0) {
++            rebuildHashTable();
++        }
++    }
++
++    private void rebuildHashTable() throws HyracksDataException {
++        FreeSpace fs = calculateFreeSpace();
++        table.close();
++        table = new SerializableHashTable(fs.tuplesInMemory, jobletCtx, bufferManagerForHashTable);
++        inMemJoiner.resetTable(table);
++        buildHashTable();
++    }
++}
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/NestedLoopJoin.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/NestedLoopJoin.java
+index 414ae25eac..ab2f75002d 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/NestedLoopJoin.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/NestedLoopJoin.java
+@@ -26,6 +26,7 @@ import org.apache.hyracks.api.comm.IFrame;
+ import org.apache.hyracks.api.comm.IFrameWriter;
+ import org.apache.hyracks.api.comm.VSizeFrame;
+ import org.apache.hyracks.api.context.IHyracksJobletContext;
++import org.apache.hyracks.api.context.IHyracksTaskContext;
+ import org.apache.hyracks.api.dataflow.value.IMissingWriter;
+ import org.apache.hyracks.api.dataflow.value.ITuplePairComparator;
+ import org.apache.hyracks.api.exceptions.ErrorCode;
+@@ -41,7 +42,7 @@ import org.apache.hyracks.dataflow.std.buffermanager.BufferInfo;
+ import org.apache.hyracks.dataflow.std.buffermanager.EnumFreeSlotPolicy;
+ import org.apache.hyracks.dataflow.std.buffermanager.FrameFreeSlotPolicyFactory;
+ import org.apache.hyracks.dataflow.std.buffermanager.VariableFrameMemoryManager;
+-import org.apache.hyracks.dataflow.std.buffermanager.VariableFramePool;
++import org.apache.hyracks.dataflow.std.buffermanager.VariableFramePoolStaticBudget;
+ 
+ public class NestedLoopJoin {
+     // Note: Min memory budget should be less than {@code AbstractJoinPOperator.MIN_FRAME_LIMIT_FOR_JOIN}
+@@ -68,15 +69,15 @@ public class NestedLoopJoin {
+     private final BufferInfo tempInfo = new BufferInfo(null, -1, -1);
+     private final BitSet outerMatchLOJ;
+ 
+-    public NestedLoopJoin(IHyracksJobletContext jobletContext, FrameTupleAccessor accessorOuter,
+-            FrameTupleAccessor accessorInner, int memBudgetInFrames, boolean isLeftOuter,
+-            IMissingWriter[] missingWriters) throws HyracksDataException {
+-        this(jobletContext, accessorOuter, accessorInner, memBudgetInFrames, isLeftOuter, missingWriters, false);
++    public NestedLoopJoin(IHyracksTaskContext ctx, FrameTupleAccessor accessorOuter, FrameTupleAccessor accessorInner,
++            int memBudgetInFrames, boolean isLeftOuter, IMissingWriter[] missingWriters) throws HyracksDataException {
++        this(ctx, accessorOuter, accessorInner, memBudgetInFrames, isLeftOuter, missingWriters, false);
+     }
+ 
+-    public NestedLoopJoin(IHyracksJobletContext jobletContext, FrameTupleAccessor accessorOuter,
+-            FrameTupleAccessor accessorInner, int memBudgetInFrames, boolean isLeftOuter,
+-            IMissingWriter[] missingWriters, boolean isReversed) throws HyracksDataException {
++    public NestedLoopJoin(IHyracksTaskContext ctx, FrameTupleAccessor accessorOuter, FrameTupleAccessor accessorInner,
++            int memBudgetInFrames, boolean isLeftOuter, IMissingWriter[] missingWriters, boolean isReversed)
++            throws HyracksDataException {
++        IHyracksJobletContext jobletContext = ctx.getJobletContext();
+         this.accessorInner = accessorInner;
+         this.accessorOuter = accessorOuter;
+         this.appender = new FrameTupleAppender();
+@@ -91,7 +92,7 @@ public class NestedLoopJoin {
+         int outerBufferMngrMemBudgetInFrames = memBudgetInFrames - minMemBudgetInFrames + 1;
+         int outerBufferMngrMemBudgetInBytes = jobletContext.getInitialFrameSize() * outerBufferMngrMemBudgetInFrames;
+         this.outerBufferMngr = new VariableFrameMemoryManager(
+-                new VariableFramePool(jobletContext, outerBufferMngrMemBudgetInBytes), FrameFreeSlotPolicyFactory
++                new VariableFramePoolStaticBudget(ctx, outerBufferMngrMemBudgetInBytes), FrameFreeSlotPolicyFactory
+                         .createFreeSlotPolicy(EnumFreeSlotPolicy.LAST_FIT, outerBufferMngrMemBudgetInFrames));
+ 
+         this.isLeftOuter = isLeftOuter;
+@@ -253,6 +254,6 @@ public class NestedLoopJoin {
+     }
+ 
+     public void releaseMemory() throws HyracksDataException {
+-        outerBufferMngr.reset();
++        outerBufferMngr.close();
+     }
+ }
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/NestedLoopJoinOperatorDescriptor.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/NestedLoopJoinOperatorDescriptor.java
+index 831753f7d2..251efe2f63 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/NestedLoopJoinOperatorDescriptor.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/NestedLoopJoinOperatorDescriptor.java
+@@ -122,8 +122,8 @@ public class NestedLoopJoinOperatorDescriptor extends AbstractOperatorDescriptor
+                 @Override
+                 public void open() throws HyracksDataException {
+                     state = new JoinCacheTaskState(jobletCtx.getJobId(), new TaskId(getActivityId(), partition));
+-                    state.joiner = new NestedLoopJoin(jobletCtx, new FrameTupleAccessor(rd0),
+-                            new FrameTupleAccessor(rd1), memSize, isLeftOuter, nullWriters1);
++                    state.joiner = new NestedLoopJoin(ctx, new FrameTupleAccessor(rd0), new FrameTupleAccessor(rd1),
++                            memSize, isLeftOuter, nullWriters1);
+                     inFrame = new VSizeFrame(ctx);
+                 }
+ 
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoin.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoin.java
+index ddf94db867..41c8dcf209 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoin.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoin.java
+@@ -63,7 +63,7 @@ public class OptimizedHybridHashJoin {
+     // Used for special probe BigObject which can not be held into the Join memory
+     private FrameTupleAppender bigFrameAppender;
+ 
+-    private final IHyracksJobletContext jobletCtx;
++    protected final IHyracksJobletContext jobletCtx;
+ 
+     private final String buildRelName;
+     private final String probeRelName;
+@@ -77,23 +77,24 @@ public class OptimizedHybridHashJoin {
+     private final IPredicateEvaluator probePredEval;
+     private final boolean isLeftOuter;
+     private final IMissingWriter[] nonMatchWriters;
+-    private final BitSet spilledStatus; //0=resident, 1=spilled
+-    private final int numOfPartitions;
+-    private final int memSizeInFrames;
+-    private InMemoryHashJoin inMemJoiner; //Used for joining resident partitions
+-    private IPartitionedTupleBufferManager bufferManager;
+-    private PreferToSpillFullyOccupiedFramePolicy spillPolicy;
+-    private final FrameTupleAccessor accessorBuild;
++    protected final BitSet spilledStatus; //0=resident, 1=spilled
++    protected final int numOfPartitions;
++    protected int memSizeInFrames;
++    protected InMemoryHashJoin inMemJoiner; //Used for joining resident partitions
++    protected IPartitionedTupleBufferManager bufferManager;
++    protected PreferToSpillFullyOccupiedFramePolicy spillPolicy;
++    protected final FrameTupleAccessor accessorBuild;
+     private final FrameTupleAccessor accessorProbe;
+-    private ISimpleFrameBufferManager bufferManagerForHashTable;
++    protected ISimpleFrameBufferManager bufferManagerForHashTable;
++    protected ISerializableTable table;
+     // Added for handling correct calling for predicate-evaluator upon recursive calls that cause role-reversal.
+     private boolean isReversed;
+     // stats information
+-    private int[] buildPSizeInTups;
++    protected int[] buildPSizeInTups;
+     private IFrame reloadBuffer;
+     // this is a reusable object to store the pointer,which is not used anywhere. we mainly use it to match the
+     // corresponding function signature.
+-    private final TuplePointer tempPtr = new TuplePointer();
++    protected final TuplePointer tempPtr = new TuplePointer();
+     private int[] probePSizeInTups;
+     private IOperatorStats stats = null;
+ 
+@@ -131,8 +132,10 @@ public class OptimizedHybridHashJoin {
+     }
+ 
+     public void initBuild() throws HyracksDataException {
+-        IDeallocatableFramePool framePool =
+-                new DeallocatableFramePool(jobletCtx, memSizeInFrames * jobletCtx.getInitialFrameSize());
++        initBuildInternal(new DeallocatableFramePool(jobletCtx, memSizeInFrames * jobletCtx.getInitialFrameSize()));
++    }
++
++    protected void initBuildInternal(IDeallocatableFramePool framePool) throws HyracksDataException {
+         bufferManagerForHashTable = new FramePoolBackedFrameBufferManager(framePool);
+         bufferManager = new VPartitionTupleBufferManager(
+                 PreferToSpillFullyOccupiedFramePolicy.createAtMostOneFrameForSpilledPartitionConstrain(spilledStatus),
+@@ -154,7 +157,7 @@ public class OptimizedHybridHashJoin {
+         }
+     }
+ 
+-    private void processTupleBuildPhase(int tid, int pid) throws HyracksDataException {
++    protected void processTupleBuildPhase(int tid, int pid) throws HyracksDataException {
+         // insertTuple prevents the tuple to acquire a number of frames that is > the frame limit
+         while (!bufferManager.insertTuple(pid, accessorBuild, tid, tempPtr)) {
+             int numFrames = bufferManager.framesNeeded(accessorBuild.getTupleLength(tid), 0);
+@@ -190,7 +193,7 @@ public class OptimizedHybridHashJoin {
+         }
+     }
+ 
+-    private void spillPartition(int pid) throws HyracksDataException {
++    protected void spillPartition(int pid) throws HyracksDataException {
+         RunFileWriter writer = getSpillWriterOrCreateNewOneIfNotExist(buildRFWriters, buildRelName, pid);
+         int spilt = bufferManager.flushPartition(pid, writer);
+         if (stats != null) {
+@@ -200,7 +203,7 @@ public class OptimizedHybridHashJoin {
+         spilledStatus.set(pid);
+     }
+ 
+-    private void closeBuildPartition(int pid) throws HyracksDataException {
++    protected void closeBuildPartition(int pid) throws HyracksDataException {
+         if (buildRFWriters[pid] == null) {
+             throw new HyracksDataException("Tried to close the non-existing file writer.");
+         }
+@@ -228,7 +231,7 @@ public class OptimizedHybridHashJoin {
+         // and tries to bring back as many spilled partitions as possible if there is free space.
+         int inMemTupCount = makeSpaceForHashTableAndBringBackSpilledPartitions();
+ 
+-        ISerializableTable table = new SerializableHashTable(inMemTupCount, jobletCtx, bufferManagerForHashTable);
++        table = new SerializableHashTable(inMemTupCount, jobletCtx, bufferManagerForHashTable);
+         this.inMemJoiner = new InMemoryHashJoin(jobletCtx, new FrameTupleAccessor(probeRd), probeHpc,
+                 new FrameTupleAccessor(buildRd), buildRd, buildHpc, isLeftOuter, nonMatchWriters, table, isReversed,
+                 bufferManagerForHashTable);
+@@ -301,6 +304,11 @@ public class OptimizedHybridHashJoin {
+      * @throws HyracksDataException
+      */
+     private int makeSpaceForHashTableAndBringBackSpilledPartitions() throws HyracksDataException {
++        FreeSpace fs = calculateFreeSpace();
++        return spillAndReloadPartitions(jobletCtx.getInitialFrameSize(), fs.freeSpace, fs.tuplesInMemory);
++    }
++
++    protected FreeSpace calculateFreeSpace() {
+         int frameSize = jobletCtx.getInitialFrameSize();
+         long freeSpace = (long) (memSizeInFrames - spilledStatus.cardinality()) * frameSize;
+ 
+@@ -311,8 +319,17 @@ public class OptimizedHybridHashJoin {
+             inMemTupCount += buildPSizeInTups[p];
+         }
+         freeSpace -= SerializableHashTable.getExpectedTableByteSize(inMemTupCount, frameSize);
++        return new FreeSpace(freeSpace, inMemTupCount);
++    }
++
++    protected static class FreeSpace {
++        final long freeSpace;
++        final int tuplesInMemory;
+ 
+-        return spillAndReloadPartitions(frameSize, freeSpace, inMemTupCount);
++        FreeSpace(long freeSpace, int tuplesInMemory) {
++            this.freeSpace = freeSpace;
++            this.tuplesInMemory = tuplesInMemory;
++        }
+     }
+ 
+     private int spillAndReloadPartitions(int frameSize, long freeSpace, int inMemTupCount) throws HyracksDataException {
+@@ -456,7 +473,7 @@ public class OptimizedHybridHashJoin {
+         return true;
+     }
+ 
+-    private void buildHashTable() throws HyracksDataException {
++    protected void buildHashTable() throws HyracksDataException {
+ 
+         for (int pid = 0; pid < numOfPartitions; pid++) {
+             if (!spilledStatus.get(pid)) {
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoinOperatorDescriptor.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoinOperatorDescriptor.java
+index d79af7960a..ba68c5a8fb 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoinOperatorDescriptor.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/OptimizedHybridHashJoinOperatorDescriptor.java
+@@ -59,7 +59,7 @@ import org.apache.hyracks.dataflow.std.base.AbstractOperatorDescriptor;
+ import org.apache.hyracks.dataflow.std.base.AbstractStateObject;
+ import org.apache.hyracks.dataflow.std.base.AbstractUnaryInputSinkOperatorNodePushable;
+ import org.apache.hyracks.dataflow.std.base.AbstractUnaryInputUnaryOutputOperatorNodePushable;
+-import org.apache.hyracks.dataflow.std.buffermanager.DeallocatableFramePool;
++import org.apache.hyracks.dataflow.std.buffermanager.DeallocatableFramePoolStaticBudget;
+ import org.apache.hyracks.dataflow.std.buffermanager.FramePoolBackedFrameBufferManager;
+ import org.apache.hyracks.dataflow.std.buffermanager.IDeallocatableFramePool;
+ import org.apache.hyracks.dataflow.std.buffermanager.ISimpleFrameBufferManager;
+@@ -293,7 +293,7 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+                     state.memForJoin = memSizeInFrames - 2;
+                     state.numOfPartitions =
+                             getNumberOfPartitions(state.memForJoin, inputsize0, fudgeFactor, nPartitions);
+-                    state.hybridHJ = new OptimizedHybridHashJoin(ctx.getJobletContext(), state.memForJoin,
++                    state.hybridHJ = new MemoryContentionResponsiveHHJ(ctx.getJobletContext(), state.memForJoin,
+                             state.numOfPartitions, PROBE_REL, BUILD_REL, probeRd, buildRd, probeHpc, buildHpc,
+                             probePredEval, buildPredEval, isLeftOuter, nonMatchWriterFactories);
+                     state.hybridHJ.setOperatorStats(stats);
+@@ -586,8 +586,8 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+                     assert isLeftOuter ? !isReversed : true : "LeftOut Join can not reverse roles";
+                     OptimizedHybridHashJoin rHHj;
+                     int n = getNumberOfPartitions(state.memForJoin, tableSize, fudgeFactor, nPartitions);
+-                    rHHj = new OptimizedHybridHashJoin(jobletCtx, state.memForJoin, n, PROBE_REL, BUILD_REL, probeRd,
+-                            buildRd, probeHpc, buildHpc, null, null, isLeftOuter, nonMatchWriterFactories); //checked-confirmed
++                    rHHj = new MemoryContentionResponsiveHHJ(jobletCtx, state.memForJoin, n, PROBE_REL, BUILD_REL,
++                            probeRd, buildRd, probeHpc, buildHpc, null, null, isLeftOuter, nonMatchWriterFactories); //checked-confirmed
+ 
+                     rHHj.setIsReversed(isReversed);
+                     try {
+@@ -734,7 +734,7 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+                             && bKeys == OptimizedHybridHashJoinOperatorDescriptor.this.probeKeys;
+                     assert isLeftOuter ? !isReversed : true : "LeftOut Join can not reverse roles";
+                     IDeallocatableFramePool framePool =
+-                            new DeallocatableFramePool(jobletCtx, state.memForJoin * jobletCtx.getInitialFrameSize());
++                            new DeallocatableFramePoolStaticBudget(ctx, state.memForJoin * ctx.getInitialFrameSize());
+                     ISimpleFrameBufferManager bufferManager = new FramePoolBackedFrameBufferManager(framePool);
+ 
+                     ISerializableTable table = new SerializableHashTable(tabSize, jobletCtx, bufferManager);
+@@ -789,7 +789,11 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+                         try {
+                             pReader.close();
+                         } finally {
+-                            joiner.closeTable();
++                            try {
++                                joiner.closeTable();
++                            } finally {
++                                framePool.close();
++                            }
+                         }
+                     }
+                 }
+@@ -800,7 +804,7 @@ public class OptimizedHybridHashJoinOperatorDescriptor extends AbstractOperatorD
+                     // Hence the reverse relation is different.
+                     boolean isReversed = outerRd == buildRd && innerRd == probeRd;
+                     ITuplePairComparator nljComptorOuterInner = isReversed ? buildComp : probComp;
+-                    NestedLoopJoin nlj = new NestedLoopJoin(jobletCtx, new FrameTupleAccessor(outerRd),
++                    NestedLoopJoin nlj = new NestedLoopJoin(ctx, new FrameTupleAccessor(outerRd),
+                             new FrameTupleAccessor(innerRd), memorySize, isLeftOuter, nonMatchWriter, isReversed);
+                     nlj.setComparator(nljComptorOuterInner);
+ 
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/sort/AbstractExternalSortRunGenerator.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/sort/AbstractExternalSortRunGenerator.java
+index e3e1992afb..d4e3340b7b 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/sort/AbstractExternalSortRunGenerator.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/sort/AbstractExternalSortRunGenerator.java
+@@ -30,7 +30,7 @@ import org.apache.hyracks.dataflow.std.buffermanager.FrameFreeSlotPolicyFactory;
+ import org.apache.hyracks.dataflow.std.buffermanager.IFrameBufferManager;
+ import org.apache.hyracks.dataflow.std.buffermanager.IFrameFreeSlotPolicy;
+ import org.apache.hyracks.dataflow.std.buffermanager.VariableFrameMemoryManager;
+-import org.apache.hyracks.dataflow.std.buffermanager.VariableFramePool;
++import org.apache.hyracks.dataflow.std.buffermanager.VariableFramePoolStaticBudget;
+ 
+ public abstract class AbstractExternalSortRunGenerator extends AbstractSortRunGenerator {
+ 
+@@ -63,7 +63,7 @@ public abstract class AbstractExternalSortRunGenerator extends AbstractSortRunGe
+ 
+         IFrameFreeSlotPolicy freeSlotPolicy = FrameFreeSlotPolicyFactory.createFreeSlotPolicy(policy, maxSortFrames);
+         IFrameBufferManager bufferManager = new VariableFrameMemoryManager(
+-                new VariableFramePool(ctx, maxSortFrames * ctx.getInitialFrameSize()), freeSlotPolicy);
++                new VariableFramePoolStaticBudget(ctx, maxSortFrames * ctx.getInitialFrameSize()), freeSlotPolicy);
+         if (alg == Algorithm.MERGE_SORT) {
+             frameSorter = new FrameSorterMergeSort(ctx, bufferManager, maxSortFrames, sortFields,
+                     keyNormalizerFactories, comparatorFactories, recordDesc, outputLimit);
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/sort/HeapSortRunGenerator.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/sort/HeapSortRunGenerator.java
+index d8431f82df..abc5b15981 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/sort/HeapSortRunGenerator.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/sort/HeapSortRunGenerator.java
+@@ -34,7 +34,7 @@ import org.apache.hyracks.dataflow.common.io.RunFileWriter;
+ import org.apache.hyracks.dataflow.std.buffermanager.IDeletableTupleBufferManager;
+ import org.apache.hyracks.dataflow.std.buffermanager.IFramePool;
+ import org.apache.hyracks.dataflow.std.buffermanager.VariableDeletableTupleMemoryManager;
+-import org.apache.hyracks.dataflow.std.buffermanager.VariableFramePool;
++import org.apache.hyracks.dataflow.std.buffermanager.VariableFramePoolStaticBudget;
+ 
+ public class HeapSortRunGenerator extends AbstractSortRunGenerator {
+     protected final IHyracksTaskContext ctx;
+@@ -63,7 +63,7 @@ public class HeapSortRunGenerator extends AbstractSortRunGenerator {
+ 
+     @Override
+     public void open() throws HyracksDataException {
+-        IFramePool framePool = new VariableFramePool(ctx, (frameLimit - 1) * ctx.getInitialFrameSize());
++        IFramePool framePool = new VariableFramePoolStaticBudget(ctx, (frameLimit - 1) * ctx.getInitialFrameSize());
+         IDeletableTupleBufferManager bufferManager =
+                 new VariableDeletableTupleMemoryManager(framePool, recordDescriptor);
+         tupleSorter = new TupleSorterHeapSort(ctx, bufferManager, topK, sortFields, nmkFactories, comparatorFactories);
+diff --git a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/sort/HybridTopKSortRunGenerator.java b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/sort/HybridTopKSortRunGenerator.java
+index 3b07017213..69394b54c3 100644
+--- a/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/sort/HybridTopKSortRunGenerator.java
++++ b/hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/sort/HybridTopKSortRunGenerator.java
+@@ -31,7 +31,7 @@ import org.apache.hyracks.dataflow.common.io.RunFileWriter;
+ import org.apache.hyracks.dataflow.std.buffermanager.EnumFreeSlotPolicy;
+ import org.apache.hyracks.dataflow.std.buffermanager.FrameFreeSlotPolicyFactory;
+ import org.apache.hyracks.dataflow.std.buffermanager.VariableFrameMemoryManager;
+-import org.apache.hyracks.dataflow.std.buffermanager.VariableFramePool;
++import org.apache.hyracks.dataflow.std.buffermanager.VariableFramePoolStaticBudget;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ 
+@@ -98,7 +98,7 @@ public class HybridTopKSortRunGenerator extends HeapSortRunGenerator {
+         } else {
+             if (frameSorter == null) {
+                 VariableFrameMemoryManager bufferManager = new VariableFrameMemoryManager(
+-                        new VariableFramePool(ctx, (frameLimit - 1) * ctx.getInitialFrameSize()),
++                        new VariableFramePoolStaticBudget(ctx, (frameLimit - 1) * ctx.getInitialFrameSize()),
+                         FrameFreeSlotPolicyFactory.createFreeSlotPolicy(EnumFreeSlotPolicy.BIGGEST_FIT,
+                                 frameLimit - 1));
+                 frameSorter = new FrameSorterMergeSort(ctx, bufferManager, frameLimit - 1, sortFields, nmkFactories,
+diff --git a/hyracks-fullstack/hyracks/hyracks-storage-am-lsm-invertedindex/src/main/java/org/apache/hyracks/storage/am/lsm/invertedindex/dataflow/LSMInvertedIndexSearchOperatorNodePushable.java b/hyracks-fullstack/hyracks/hyracks-storage-am-lsm-invertedindex/src/main/java/org/apache/hyracks/storage/am/lsm/invertedindex/dataflow/LSMInvertedIndexSearchOperatorNodePushable.java
+index 742a86c14a..4253df4238 100644
+--- a/hyracks-fullstack/hyracks/hyracks-storage-am-lsm-invertedindex/src/main/java/org/apache/hyracks/storage/am/lsm/invertedindex/dataflow/LSMInvertedIndexSearchOperatorNodePushable.java
++++ b/hyracks-fullstack/hyracks/hyracks-storage-am-lsm-invertedindex/src/main/java/org/apache/hyracks/storage/am/lsm/invertedindex/dataflow/LSMInvertedIndexSearchOperatorNodePushable.java
+@@ -26,7 +26,7 @@ import org.apache.hyracks.api.exceptions.HyracksDataException;
+ import org.apache.hyracks.api.util.HyracksConstants;
+ import org.apache.hyracks.dataflow.common.data.accessors.FrameTupleReference;
+ import org.apache.hyracks.dataflow.common.utils.TaskUtil;
+-import org.apache.hyracks.dataflow.std.buffermanager.DeallocatableFramePool;
++import org.apache.hyracks.dataflow.std.buffermanager.DeallocatableFramePoolStaticBudget;
+ import org.apache.hyracks.dataflow.std.buffermanager.FramePoolBackedFrameBufferManager;
+ import org.apache.hyracks.dataflow.std.buffermanager.IDeallocatableFramePool;
+ import org.apache.hyracks.dataflow.std.buffermanager.ISimpleFrameBufferManager;
+@@ -82,7 +82,7 @@ public class LSMInvertedIndexSearchOperatorNodePushable extends IndexSearchOpera
+         }
+         this.numOfFields = numOfFields;
+         // Intermediate and final search result will use this buffer manager to get frames.
+-        this.framePool = new DeallocatableFramePool(ctx, frameLimit * ctx.getInitialFrameSize());
++        this.framePool = new DeallocatableFramePoolStaticBudget(ctx, frameLimit * ctx.getInitialFrameSize());
+         this.bufferManagerForSearch = new FramePoolBackedFrameBufferManager(framePool);
+         // Keep the buffer manager in the hyracks context so that the search process can get it via the context.
+         TaskUtil.put(HyracksConstants.INVERTED_INDEX_SEARCH_FRAME_MANAGER, bufferManagerForSearch, ctx);
+@@ -122,4 +122,13 @@ public class LSMInvertedIndexSearchOperatorNodePushable extends IndexSearchOpera
+     protected void addAdditionalIndexAccessorParams(IIndexAccessParameters iap) throws HyracksDataException {
+         iap.getParameters().put(HyracksConstants.HYRACKS_TASK_CONTEXT, ctx);
+     }
++
++    @Override
++    public void close() throws HyracksDataException {
++        try {
++            super.close();
++        } finally {
++            framePool.close();
++        }
++    }
+ }
+diff --git a/hyracks-fullstack/hyracks/hyracks-storage-am-lsm-vtree/src/main/java/org/apache/hyracks/storage/am/lsm/vector/impls/SpillableTopKBuffer.java b/hyracks-fullstack/hyracks/hyracks-storage-am-lsm-vtree/src/main/java/org/apache/hyracks/storage/am/lsm/vector/impls/SpillableTopKBuffer.java
+index 7fdbb3cbed..dc04b0e33d 100644
+--- a/hyracks-fullstack/hyracks/hyracks-storage-am-lsm-vtree/src/main/java/org/apache/hyracks/storage/am/lsm/vector/impls/SpillableTopKBuffer.java
++++ b/hyracks-fullstack/hyracks/hyracks-storage-am-lsm-vtree/src/main/java/org/apache/hyracks/storage/am/lsm/vector/impls/SpillableTopKBuffer.java
+@@ -43,7 +43,7 @@ import org.apache.hyracks.dataflow.std.buffermanager.IDeletableTupleBufferManage
+ import org.apache.hyracks.dataflow.std.buffermanager.IFramePool;
+ import org.apache.hyracks.dataflow.std.buffermanager.ITuplePointerAccessor;
+ import org.apache.hyracks.dataflow.std.buffermanager.VariableDeletableTupleMemoryManager;
+-import org.apache.hyracks.dataflow.std.buffermanager.VariableFramePool;
++import org.apache.hyracks.dataflow.std.buffermanager.VariableFramePoolStaticBudget;
+ import org.apache.hyracks.dataflow.std.structures.IResetableComparable;
+ import org.apache.hyracks.dataflow.std.structures.MaxHeap;
+ import org.apache.hyracks.dataflow.std.structures.TuplePointer;
+@@ -119,7 +119,7 @@ public class SpillableTopKBuffer {
+         }
+         int fieldCount = tuple.getFieldCount();
+         this.tupleRecordDescriptor = new RecordDescriptor(new ISerializerDeserializer[fieldCount]);
+-        IFramePool framePool = new VariableFramePool(ctx, budgetBytes);
++        IFramePool framePool = new VariableFramePoolStaticBudget(ctx, budgetBytes);
+         this.bufferManager = new VariableDeletableTupleMemoryManager(framePool, tupleRecordDescriptor);
+         this.bufferAccessor = bufferManager.createTuplePointerAccessor();
+         this.topKHeap = new MaxHeap(new VectorSearchHeapEntryFactory(), candidateLimit);
+diff --git a/hyracks-fullstack/hyracks/hyracks-test-support/src/main/java/org/apache/hyracks/test/support/TestJobletContext.java b/hyracks-fullstack/hyracks/hyracks-test-support/src/main/java/org/apache/hyracks/test/support/TestJobletContext.java
+index 43567bc979..76cc55df88 100644
+--- a/hyracks-fullstack/hyracks/hyracks-test-support/src/main/java/org/apache/hyracks/test/support/TestJobletContext.java
++++ b/hyracks-fullstack/hyracks/hyracks-test-support/src/main/java/org/apache/hyracks/test/support/TestJobletContext.java
+@@ -28,6 +28,7 @@ import org.apache.hyracks.api.exceptions.HyracksDataException;
+ import org.apache.hyracks.api.exceptions.HyracksException;
+ import org.apache.hyracks.api.io.FileReference;
+ import org.apache.hyracks.api.io.IIOManager;
++import org.apache.hyracks.api.job.ActivityClusterGraph;
+ import org.apache.hyracks.api.job.IJobletEventListenerFactory;
+ import org.apache.hyracks.api.job.JobId;
+ import org.apache.hyracks.api.job.JobKind;
+@@ -82,6 +83,11 @@ public class TestJobletContext implements IHyracksJobletContext {
+         return null;
+     }
+ 
++    @Override
++    public ActivityClusterGraph getActivityClusterGraph() {
++        return null;
++    }
++
+     @Override
+     public void deallocateFrames(int bytes) {
+         frameManger.deallocateFrames(bytes);
+diff --git a/hyracks-fullstack/hyracks/hyracks-test-support/src/main/java/org/apache/hyracks/test/support/TestNCServiceContext.java b/hyracks-fullstack/hyracks/hyracks-test-support/src/main/java/org/apache/hyracks/test/support/TestNCServiceContext.java
+index b13c969c26..826f63a351 100644
+--- a/hyracks-fullstack/hyracks/hyracks-test-support/src/main/java/org/apache/hyracks/test/support/TestNCServiceContext.java
++++ b/hyracks-fullstack/hyracks/hyracks-test-support/src/main/java/org/apache/hyracks/test/support/TestNCServiceContext.java
+@@ -38,6 +38,7 @@ import org.apache.hyracks.api.lifecycle.LifeCycleComponentManager;
+ import org.apache.hyracks.api.messages.IMessageBroker;
+ import org.apache.hyracks.api.resources.memory.IFrameProfiler;
+ import org.apache.hyracks.api.resources.memory.IMemoryManager;
++import org.apache.hyracks.api.resources.memory.IResourceBroker;
+ import org.apache.hyracks.api.service.IControllerService;
+ import org.apache.hyracks.control.common.controllers.NCConfig;
+ import org.apache.hyracks.control.nc.NodeControllerService;
+@@ -165,6 +166,16 @@ public class TestNCServiceContext implements INCServiceContext {
+         // do nothing
+     }
+ 
++    @Override
++    public IResourceBroker getResourceBroker() {
++        return null;
++    }
++
++    @Override
++    public void setResourceBroker(IResourceBroker resourceBroker) {
++        // do nothing
++    }
++
+     @Override
+     public IVSizeFrameFactory getVSizeFrameFactoryForKind(JobKind jobKind) {
+         return IVSizeFrameFactory.DEFAULT;
+-- 
+2.50.1 (Apple Git-155)
+
